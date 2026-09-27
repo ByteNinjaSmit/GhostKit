@@ -248,7 +248,14 @@ let ghostOverlayWindow: BrowserWindow | null = null
 let savedOverlayBounds: { x: number; y: number; width: number; height: number } | null = null
 
 let stealthAlwaysOnTop = false
-let stealthSkipTaskbar = false
+// Default ON: the main window ships without a taskbar button, which (a) keeps it
+// off the taskbar/Alt-Tab and (b) makes Windows Task Manager list the process
+// under "Background processes" rather than "Apps". This does NOT hide the
+// process -- it stays fully visible and named in Task Manager (and flat in the
+// Details tab). Because there's no taskbar/Alt-Tab entry, the window is summoned
+// with MAIN_WINDOW_HOTKEY (see below). Toggle it off in Settings if you want the
+// normal taskbar button back.
+let stealthSkipTaskbar = true
 let ghostClickThrough = false
 let ghostOpacity = 0.95
 
@@ -320,6 +327,13 @@ const liveEventSink: geminiLive.GeminiLiveEventSink = {
 // ---------------------------------------------------------------------------
 
 const SCREENSHOT_HOTKEY = 'CommandOrControl+Shift+S'
+
+/**
+ * Summons (shows + focuses) the main window. With `stealthSkipTaskbar` on there
+ * is no taskbar button or Alt-Tab entry, so this is the reliable way to bring
+ * the window back after it loses focus or is minimized.
+ */
+const MAIN_WINDOW_HOTKEY = 'CommandOrControl+Alt+M'
 
 /** Minimum time between accepted captures -- ignores a second hotkey press (or button click) that lands within this window of the last one, so an accidental double-press/hold doesn't fire two captures. */
 const SCREENSHOT_DEBOUNCE_MS = 5_000
@@ -1219,6 +1233,16 @@ void app
       })
     } catch (e) {
       console.warn('[stealth] could not register panic hotkey:', redact(String(e)))
+    }
+
+    // With no taskbar button / Alt-Tab entry (stealthSkipTaskbar default), this
+    // is how the user brings the main window back to the foreground.
+    try {
+      globalShortcut.register(MAIN_WINDOW_HOTKEY, () => {
+        bringWindowForward()
+      })
+    } catch (e) {
+      console.warn('[stealth] could not register main-window hotkey:', redact(String(e)))
     }
 
     // The screenshot hotkey is deliberately NOT registered here: it is

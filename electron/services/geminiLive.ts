@@ -563,7 +563,7 @@ async function openConnection(apiKey: string, resumeHandle: string | null, myGen
         if (abandoned) return
         handleServerMessage(myGeneration, message)
       },
-      onerror: (event) => {
+      onerror: (event: unknown) => {
         // 'onclose' always follows and drives reconnection/state -- this is
         // diagnostic-only, and redacted like any other error text that
         // might reach a log.
@@ -602,7 +602,7 @@ async function openConnection(apiKey: string, resumeHandle: string | null, myGen
     // close it as soon as it shows up instead.
     abandoned = true
     void connectPromise
-      .then((lateSession) => {
+      .then((lateSession: Session) => {
         safeClose(lateSession)
       })
       .catch(() => {
