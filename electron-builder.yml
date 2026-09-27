@@ -1,0 +1,99 @@
+# electron-builder config for MockPilot (Windows NSIS installer, x64).
+# See: https://www.electron.build/configuration/configuration
+#
+# UNSIGNED: no code-signing certificate is configured, so the installer and
+# the app exe are unsigned and Windows SmartScreen will show a "Windows
+# protected your PC / unknown publisher" warning on first run. That is
+# expected for this build; signing needs a certificate (win.certificateFile /
+# CSC_LINK or Azure Trusted Signing) which is out of scope here.
+#
+# Build with `npm run build:win` (runs `npm run typecheck` first, via `build`).
+# Output: dist/MockPilot-Setup-<version>-x64.exe plus dist/win-unpacked/.
+
+appId: com.mockpilot.app
+productName: MockPilot
+copyright: Copyright © 2026 MockPilot
+artifactName: ${productName}-Setup-${version}-${arch}.${ext}
+
+directories:
+  output: dist
+  buildResources: build
+
+# Native addons (keytar, better-sqlite3) ship N-API prebuilt binaries that load
+# under Electron's ABI unchanged (this is what `npm run dev` already relies
+# on), so electron-builder must not try to recompile them from source (that
+# would need Python + MSVC on the build machine for no benefit).
+npmRebuild: false
+
+files:
+  - out/**/*
+  - package.json
+  # electron/lib/promptTemplate.ts reads these at runtime via
+  # `app.getAppPath()` -- they're data, not code, so they must be listed
+  # explicitly or a packaged build would silently ship without them.
+  - prompts/**/*
+  # Renderer-only libraries (react, monaco, recharts, ...) are bundled into
+  # out/renderer by Vite and live in devDependencies, so electron-builder does
+  # not copy them into the package; only main-process runtime deps do.
+  # Trim what those ship that is never used at runtime:
+  - '!**/*.map'
+  - '!node_modules/**/*.md'
+  - '!node_modules/**/{test,tests,__tests__,docs,example,examples}/**'
+  # better-sqlite3: the C source of SQLite and the addon (deps/, src/) is only
+  # needed to compile from source; other platforms' prebuilt binaries are dead
+  # weight on a Windows x64 build.
+  - '!node_modules/better-sqlite3/{deps,src}/**'
+  - '!node_modules/better-sqlite3/prebuilds/{darwin,linux,linuxmusl}-*.node'
+  - '!node_modules/better-sqlite3/prebuilds/win32-arm64.node'
+  - '!node_modules/keytar/src/**'
+  # pdf-parse bundles four pdf.js builds; electron/services/rag.ts calls it
+  # WITHOUT a `version` option, so it always loads its default, v1.10.100
+  # (lib/pdf-parse.js DEFAULT_OPTIONS.version). The other three are never
+  # required -- verified by parsing a PDF from the packaged app.
+  - '!node_modules/pdf-parse/lib/pdf.js/{v1.9.426,v1.10.88,v2.0.550}/**'
+
+asarUnpack:
+  # Anything that is dlopen()ed / LoadLibrary()ed by the OS loader cannot be
+  # loaded from inside app.asar (Electron's asar shim only covers Node's `fs`).
+  # keytar's and better-sqlite3's .node addons: Electron can auto-extract
+  # .node files, but listing the packages makes the layout explicit.
+  - '**/node_modules/keytar/**/*'
+  - '**/node_modules/better-sqlite3/**/*'
+  # sqlite-vec-windows-x64 holds vec0.dll, loaded by SQLite's own extension
+  # loader (electron/services/rag.ts rewrites app.asar -> app.asar.unpacked
+  # before calling loadExtension). The `sqlite-vec` JS package itself only
+  # resolves that path and stays inside the asar.
+  - '**/node_modules/sqlite-vec-windows-x64/**/*'
+
+# The window icon (electron/main.ts -> BrowserWindow `icon`) is read from disk
+# at <resources>/icon.png, not from inside the asar.
+extraResources:
+  - from: build/icon.png
+    to: icon.png
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.ico
+  # Explicit: signing is intentionally NOT required (no certificate is
+  # configured). The "signing with signtool ..." line in the build log is
+  # electron-builder's skip path for an unset certificate, not a signing
+  # attempt -- the output is unsigned either way.
+  forceCodeSigning: false
+
+nsis:
+  # Per-user install (no admin prompt, installs under %LOCALAPPDATA%\Programs),
+  # with the install directory changeable in the wizard.
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  # Uninstall keeps the user's data (API key in Credential Manager, and the
+  # rag/history databases under %APPDATA%\mockpilot) -- see README for how to
+  # remove it by hand.
+  deleteAppDataOnUninstall: false
+
+publish: null

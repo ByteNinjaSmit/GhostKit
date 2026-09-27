@@ -1,0 +1,20 @@
+node_modules/
+out/
+dist/
+dist-electron/
+release/
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+*.log
+
+# Editor/OS
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+
+# Env
+.env
+.env.local
