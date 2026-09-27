@@ -17,6 +17,7 @@ MockPilot is a cross-process [Electron](https://www.electronjs.org/) desktop app
 - [Installation](#installation)
 - [Configuration (Gemini API key)](#configuration-gemini-api-key)
 - [Running in development](#running-in-development)
+- [Estimated API cost (Gemini, in ₹)](#estimated-api-cost-gemini-in-)
 - [Building the Windows installer](#building-the-windows-installer)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Where your data lives](#where-your-data-lives)
@@ -105,6 +106,65 @@ npm run dev
 ```
 
 This starts `electron-vite` with hot-reload for the renderer and launches the app. Main-process logs stream to the terminal — the fastest way to see runtime errors.
+
+## Estimated API cost (Gemini, in ₹)
+
+MockPilot is **BYO-key** — you pay Google directly for the Gemini API calls it makes. The numbers below are **estimates** to help you budget; your actual bill depends on how much you talk, prompt sizes, and Google's current prices. Google also offers a **free tier** with rate limits that may cover light practice at ₹0.
+
+**Assumptions used:** paid-tier rates from Google (Sept 2026), **1 USD ≈ ₹95.8**, audio billed at **32 tokens/sec input** and **25 tokens/sec output** (so 1 min of speech ≈ 1,920 input / 1,500 output tokens). Always confirm against the [official pricing page](https://ai.google.dev/gemini-api/docs/pricing) and your own billing dashboard.
+
+### Per-token rates (per 1,000,000 tokens)
+
+| Model / usage | Price (USD) | Price (₹) |
+|---|---|---|
+| **Live voice — `gemini-2.5-flash` native audio** (the interview) | | |
+| &nbsp;&nbsp;• text input | $0.50 | ≈ ₹47.9 |
+| &nbsp;&nbsp;• audio input | $3.00 | ≈ ₹287 |
+| &nbsp;&nbsp;• text output | $2.00 | ≈ ₹192 |
+| &nbsp;&nbsp;• **audio output** (the costly one) | $12.00 | ≈ ₹1,150 |
+| **Text/vision — `gemini-2.5-flash`** (hints, review, screenshot) | | |
+| &nbsp;&nbsp;• text / image input | $0.30 | ≈ ₹28.7 |
+| &nbsp;&nbsp;• text output | $2.50 | ≈ ₹239 |
+| **Embeddings — `gemini-embedding-001`** (RAG indexing) | $0.15 | ≈ ₹14.4 |
+
+### Per-minute cost — live voice interview (the main driver)
+
+Audio output at ₹1,150/1M tokens dominates. For **1 minute of active conversation** (≈30 s of AI speech out + ≈30 s of your speech in, plus transcript/context overhead):
+
+| Component | Tokens/min | Cost/min (₹) |
+|---|---|---|
+| Audio output (AI speaks ~30 s) | ~750 | ≈ ₹0.86 |
+| Audio input (you speak ~30 s) | ~960 | ≈ ₹0.28 |
+| Text transcript + context overhead | — | ≈ ₹0.10–0.30 |
+| **Total** | | **≈ ₹1.2 – ₹1.7 / min** |
+
+**Rule of thumb: ~₹1.5 per minute** of live interview. A denser back-and-forth trends toward the top of the range; long pauses cost less.
+
+### Per-hour cost
+
+| Usage | Estimate |
+|---|---|
+| **Live voice interview**, 1 hour continuous | **≈ ₹90 – ₹100 / hour** (~$0.95–1.05) |
+| Typical 45-min mock interview | ≈ ₹55 – ₹75 |
+
+### Per-action cost — coding round & RAG (cheap)
+
+These are per-call, not per-minute, and are a rounding error next to voice:
+
+| Action | Typical cost |
+|---|---|
+| One **hint** (`gemini-2.5-flash`) | ≈ ₹0.15 |
+| One **code review** / answer review | ≈ ₹0.30 |
+| One **screenshot → problem** (vision) | ≈ ₹0.05 – 0.10 |
+| **Indexing** a ~20-page PDF for RAG | ≈ ₹0.20 (one-time) |
+
+### "If I'm using everything" — all-in hourly
+
+A heavy 1-hour session — continuous voice interview **plus** a coding round (say ~15 hints + ~5 reviews) **plus** RAG indexing and queries:
+
+> **≈ ₹95 – ₹110 per hour** (~$1.0–1.15). The live voice is ~95% of it; text and embeddings add only a few rupees.
+
+**Caveats:** estimates only; prices, the ₹/$ rate, and audio-token rates change; "thinking"/reasoning tokens, cached input, and retries can shift the total. `gemini-embedding-001` is a legacy model (Google lists a newer embedding model on the pricing page) — swap it in `electron/services/rag.ts` if you want current-gen embeddings. Track real spend in your Google AI Studio / Cloud billing console.
 
 ## Building the Windows installer
 
