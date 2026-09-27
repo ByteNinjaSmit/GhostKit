@@ -33,6 +33,8 @@ export const IPC_CHANNELS = {
   GEMINI_LIVE_AUDIO_CHUNK: 'gemini-live:audio-chunk',
   GEMINI_LIVE_CONNECTION_STATE: 'gemini-live:connection-state',
   GEMINI_LIVE_INTERRUPTED: 'gemini-live:interrupted',
+  GEMINI_LIVE_TURN_FINISHED: 'gemini-live:turn-finished',
+  GEMINI_LIVE_TRANSLATION: 'gemini-live:translation',
 
   // Phase 3 -- resume/JD ingestion (renderer-initiated invoke). The renderer
   // only ever sends raw PDF bytes + pasted JD text up; PDF parsing, chunking,
@@ -40,6 +42,19 @@ export const IPC_CHANNELS = {
   RAG_INDEX_MATERIALS: 'rag:index-materials',
   RAG_STATUS: 'rag:status',
   RAG_CLEAR_MATERIALS: 'rag:clear-materials',
+
+  // Prepared Q&A bank -- a candidate-curated list of {question, answer}
+  // pairs for THIS interview, embedded/retrieved the same way as resume/JD
+  // (see rag.ts's "Prepared Q&A bank" section) but its own independent
+  // source, bulk-replaced/cleared/status'd separately from RAG_* above.
+  QA_BANK_INDEX: 'qa-bank:index',
+  QA_BANK_STATUS: 'qa-bank:status',
+  QA_BANK_CLEAR: 'qa-bank:clear',
+
+  // Learned answer cache -- auto-populated (see rag.ts), read-only status +
+  // clear only (no bulk-edit/index channel, unlike the qa bank above).
+  LEARNED_ANSWERS_STATUS: 'learned-answers:status',
+  LEARNED_ANSWERS_CLEAR: 'learned-answers:clear',
 
   // Phase 4 -- main-initiated push event, same shape/discipline as the four
   // GEMINI_LIVE_* push channels above: one per completed candidate answer
@@ -134,7 +149,7 @@ export interface TestKeyResult {
 // ---------------------------------------------------------------------------
 
 /** Who a piece of live-transcribed speech belongs to. */
-export type GeminiLiveSpeaker = 'user' | 'interviewer'
+export type GeminiLiveSpeaker = 'interviewer' | 'assistant' | 'user'
 
 /**
  * One incremental transcript fragment. Gemini Live streams transcription in
@@ -147,6 +162,44 @@ export interface GeminiLiveTranscriptEvent {
   speaker: GeminiLiveSpeaker
   textDelta: string
   finished: boolean
+}
+
+/**
+ * Fired once a turn's history row has been written, for ANY speaker --
+ * authoritative confirmation that this turn is actually over, independent of
+ * whether the transcript fragments themselves ever carried `finished: true`.
+ *
+ * Gemini's own per-fragment `Transcription.finished` field is documented as
+ * optional and in practice is unreliable -- a turn frequently never gets one,
+ * which (before this event existed) left its transcript bubble stuck showing
+ * a "listening…"/"generating…" indicator forever, even after later turns had
+ * already started. This event is geminiLive.ts's OWN determination that the
+ * turn ended (explicit `finished` flag, an implicit boundary -- the speaker
+ * changed -- or `turnComplete`, whichever fires first), sent once right after
+ * that turn's history row is written. The renderer should treat this as an
+ * unconditional override: find the last transcript item for `speaker` and
+ * mark it finished (and, for 'interviewer', tag it with `turnId` so a later
+ * `GeminiLiveTranslationEvent` for the same turn can find it), regardless of
+ * whatever `finished` value its own fragments last reported.
+ */
+export interface GeminiLiveTurnFinishedEvent {
+  speaker: GeminiLiveSpeaker
+  turnId: number
+}
+
+/**
+ * The interviewer's question, translated to English -- Gemini Live's own
+ * `inputAudioTranscription` transcribes speech in whatever language/script
+ * it was spoken in (e.g. Devanagari for Hindi) rather than translating it.
+ * Fired once, asynchronously, some time after the matching
+ * `GeminiLiveInterviewerTurnEvent` for the same `turnId` (a separate
+ * generateContent call -- see electron/services/translate.ts); never sent if
+ * that call fails, so the renderer just keeps showing the original
+ * transcription in that case.
+ */
+export interface GeminiLiveTranslationEvent {
+  turnId: number
+  translatedText: string
 }
 
 /** One chunk of interviewer speech audio: raw PCM16 bytes, 24kHz, mono, little-endian (Gemini Live's fixed output format). */
@@ -231,6 +284,45 @@ export interface RagIndexResult {
 export interface RagStatusResult {
   resumeChunkCount: number
   jdChunkCount: number
+}
+
+/**
+ * A candidate-curated question the interviewer might ask, with the exact
+ * answer the candidate wants used -- see electron/services/rag.ts's "Prepared
+ * Q&A bank" section. Bulk-replaced as a whole list (QA_BANK_INDEX), same
+ * full-replace semantics as RAG_INDEX_MATERIALS.
+ */
+export interface QaBankEntry {
+  question: string
+  answer: string
+}
+
+/** Upper bounds on the prepared Q&A bank -- enforced both in Setup.tsx (a friendly early rejection) and main-process-side in main.ts/rag.ts (the actual authority). */
+export const MAX_QA_ENTRIES = 200
+export const MAX_QA_QUESTION_CHARS = 500
+export const MAX_QA_ANSWER_CHARS = 3_000
+
+/** Result of `QA_BANK_INDEX`: embed -> store the given list of Q&A pairs. */
+export interface QaBankIndexResult {
+  ok: boolean
+  error?: string
+  /** Number of entries stored, if the request succeeded. */
+  count?: number
+}
+
+/** Current qa bank entry count, as actually stored. */
+export interface QaBankStatusResult {
+  count: number
+}
+
+/**
+ * Current learned-answer cache entry count -- see rag.ts's "Learned answer
+ * cache" section. Unlike the qa bank above, this is filled automatically
+ * (every live-generated answer gets cached), not authored by the candidate;
+ * the UI surface for it is read-only status + a clear button, no bulk-edit.
+ */
+export interface LearnedAnswerStatusResult {
+  count: number
 }
 
 // ---------------------------------------------------------------------------
@@ -705,12 +797,20 @@ export interface MockPilotApi {
   /** Closes the current Gemini Live session, if any. Safe to call when nothing is running. */
   stopLiveSession: () => Promise<OperationResult>
   /**
-   * Sends one mic PCM16 chunk (16kHz mono, from src/audio/pipeline.ts's
-   * worklet) to the active live session. Mic audio only -- never
-   * system-audio loopback, see electron/services/geminiLive.ts's doc
-   * comment for why.
+   * Sends one PCM16 chunk (16kHz mono, from src/audio/pipeline.ts's
+   * system-audio worklet) to the active live session.
    */
-  sendMicChunk: (chunk: ArrayBuffer) => Promise<OperationResult>
+  sendAudioChunk?: (chunk: ArrayBuffer, capturedAtMs: number) => Promise<OperationResult>
+  /**
+   * `capturedAtMs` is `Date.now()` in the RENDERER at the moment the worklet
+   * handed this chunk to its `onChunk` callback -- carried through so the
+   * main process can log the true renderer-capture -> main-process-receipt
+   * latency of this app's OWN pipeline (IPC hop included), separate from
+   * Gemini's own server-side transcription latency (see geminiLive.ts's
+   * `sendAudioChunk` doc comment). Both processes read the same OS clock, so
+   * this is directly comparable with no clock-sync concerns.
+   */
+  sendMicChunk: (chunk: ArrayBuffer, capturedAtMs: number) => Promise<OperationResult>
 
   /** Subscribes to live transcript fragments. Returns an unsubscribe function. */
   onLiveTranscript: (callback: (event: GeminiLiveTranscriptEvent) => void) => () => void
@@ -725,6 +825,10 @@ export interface MockPilotApi {
    * `clear()`). Returns an unsubscribe function.
    */
   onLiveInterrupted: (callback: () => void) => () => void
+  /** Subscribes to authoritative turn-finished signals, for any speaker (see `GeminiLiveTurnFinishedEvent`). Returns an unsubscribe function. */
+  onLiveTurnFinished: (callback: (event: GeminiLiveTurnFinishedEvent) => void) => () => void
+  /** Subscribes to English translations of the interviewer's question (see `GeminiLiveTranslationEvent`). Returns an unsubscribe function. */
+  onLiveTranslation: (callback: (event: GeminiLiveTranslationEvent) => void) => () => void
   /**
    * Subscribes to per-answer review results: a structured Gemini review plus
    * local speech metrics for one completed candidate answer turn (see
@@ -747,6 +851,22 @@ export interface MockPilotApi {
   getRagStatus: () => Promise<RagStatusResult>
   /** Deletes all stored resume/JD chunks. There is no other way to remove this data once indexed. */
   clearInterviewMaterials: () => Promise<OperationResult>
+
+  /**
+   * Replaces the entire prepared Q&A bank with `entries` -- a full replace,
+   * same semantics as `indexInterviewMaterials`, not an append. An empty
+   * array clears it. Never throws; resolves to a typed result.
+   */
+  indexQaBank: (entries: QaBankEntry[]) => Promise<QaBankIndexResult>
+  /** Current stored qa bank entry count, for display. */
+  getQaBankStatus: () => Promise<QaBankStatusResult>
+  /** Deletes the entire stored qa bank. There is no other way to remove this data once indexed. */
+  clearQaBank: () => Promise<OperationResult>
+
+  /** Current learned-answer cache entry count, for display -- see rag.ts's "Learned answer cache" section. */
+  getLearnedAnswerStatus: () => Promise<LearnedAnswerStatusResult>
+  /** Deletes the entire learned-answer cache. The escape hatch if a wrong cached answer ever shows up. */
+  clearLearnedAnswers: () => Promise<OperationResult>
 
   /**
    * Manually triggers the same local screen capture the global hotkey does.

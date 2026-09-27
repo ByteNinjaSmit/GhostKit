@@ -1,23 +1,29 @@
 import { useEffect, useRef, useState } from 'react'
-import type {
-  GeminiLiveAnswerReviewEvent,
-  GeminiLiveConnectionStateEvent,
-  GeminiLiveTranscriptEvent,
-  HintsResult,
-  StealthState
-} from '../../electron/ipc-types'
 import {
+  DEFAULT_INTERVIEW_SETUP,
   GHOST_CLICKTHROUGH_HOTKEY_LABEL,
   GHOST_OVERLAY_HOTKEY_LABEL,
-  GHOST_PANIC_HOTKEY_LABEL
+  GHOST_PANIC_HOTKEY_LABEL,
+  type GeminiLiveAnswerReviewEvent,
+  type GeminiLiveConnectionStateEvent,
+  type GeminiLiveSpeaker,
+  type GeminiLiveTranscriptEvent,
+  type GeminiLiveTranslationEvent,
+  type GeminiLiveTurnFinishedEvent,
+  type HintsResult,
+  type StealthState
 } from '../../electron/ipc-types'
+import { startCapture, stopCapture, type CaptureStreams } from '@/audio/capture'
+import { createAudioPipeline, type AudioPipelineHandle } from '@/audio/pipeline'
 import { cn } from '@/lib/utils'
 
 interface TranscriptItem {
   id: number
-  speaker: 'user' | 'interviewer'
+  speaker: GeminiLiveSpeaker
   text: string
   finished: boolean
+  /** Set once an 'interviewer' item's history row exists (see onLiveInterviewerTurn) -- lets a later onLiveTranslation event find and replace this item's text. */
+  turnId?: number
 }
 
 export default function GhostOverlay(): JSX.Element {
@@ -34,6 +40,9 @@ export default function GhostOverlay(): JSX.Element {
   const [transcripts, setTranscripts] = useState<TranscriptItem[]>([])
   const [connState, setConnState] = useState<GeminiLiveConnectionStateEvent['state']>('closed')
   const [latestReview, setLatestReview] = useState<GeminiLiveAnswerReviewEvent | null>(null)
+  const [isStarting, setIsStarting] = useState(false)
+  const [sessionError, setSessionError] = useState<string | null>(null)
+  const [copiedId, setCopiedId] = useState<number | null>(null)
 
   // Quick Hints / Cheat tab state
   const [quickPrompt, setQuickPrompt] = useState('')
@@ -46,6 +55,15 @@ export default function GhostOverlay(): JSX.Element {
 
   const nextIdRef = useRef(0)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const pipelineRef = useRef<AudioPipelineHandle | null>(null)
+  const streamsRef = useRef<CaptureStreams | null>(null)
+
+  const teardown = (): void => {
+    pipelineRef.current?.dispose()
+    pipelineRef.current = null
+    stopCapture()
+    streamsRef.current = null
+  }
 
   // Set html/body background to transparent for the overlay window
   useEffect(() => {
@@ -63,11 +81,18 @@ export default function GhostOverlay(): JSX.Element {
     })
 
     const unsubscribeTranscript = window.api.onLiveTranscript((event: GeminiLiveTranscriptEvent) => {
+      let delta = event.textDelta
+      if (event.speaker === 'assistant') {
+        delta = delta
+          .replace(/\*\*(?:Awaiting Prompt Clarity|Awaiting User Input|Acknowledge Audio Clarity|Maintaining Silence)[^*]*\*\*/gi, '')
+          .replace(/I'm designed to be a silent observer until prompted\.[^.\n]*\.?/gi, '')
+          .replace(/I'm currently maintaining silence[^.\n]*\.?/gi, '')
+      }
       setTranscripts((prev) => {
         const last = prev[prev.length - 1]
         if (last && last.speaker === event.speaker && !last.finished) {
           const updated = prev.slice(0, -1)
-          updated.push({ ...last, text: last.text + event.textDelta, finished: event.finished })
+          updated.push({ ...last, text: last.text + delta, finished: event.finished })
           return updated
         }
         return [
@@ -75,15 +100,50 @@ export default function GhostOverlay(): JSX.Element {
           {
             id: ++nextIdRef.current,
             speaker: event.speaker,
-            text: event.textDelta,
+            text: delta,
             finished: event.finished
           }
         ]
       })
     })
 
+    const unsubscribeTurnFinished = window.api.onLiveTurnFinished((event: GeminiLiveTurnFinishedEvent) => {
+      // Authoritative override: force the last item for this speaker to
+      // `finished: true` regardless of what its own fragments last reported
+      // (see GeminiLiveTurnFinishedEvent's doc comment -- Gemini's per-fragment
+      // `finished` flag is unreliable and otherwise leaves bubbles stuck on
+      // "listening…"/"generating…" indefinitely). Also tags `turnId` so a
+      // later translation event for an 'interviewer' turn can find it.
+      setTranscripts((prev) => {
+        const lastIdx = prev.map((t) => t.speaker).lastIndexOf(event.speaker)
+        if (lastIdx === -1) return prev
+        const updated = [...prev]
+        updated[lastIdx] = { ...updated[lastIdx], turnId: event.turnId, finished: true }
+        return updated
+      })
+    })
+
+    const unsubscribeTranslation = window.api.onLiveTranslation((event: GeminiLiveTranslationEvent) => {
+      setTranscripts((prev) => {
+        const idx = prev.findIndex((t) => t.turnId === event.turnId)
+        if (idx === -1) return prev
+        const updated = [...prev]
+        updated[idx] = { ...updated[idx], text: event.translatedText }
+        return updated
+      })
+    })
+
     const unsubscribeConn = window.api.onLiveConnectionState((event: GeminiLiveConnectionStateEvent) => {
       setConnState(event.state)
+      if (event.state === 'closed') {
+        teardown()
+        setIsStarting(false)
+      }
+      if (event.state === 'error') {
+        setSessionError(event.message ?? 'Live session encountered an error.')
+        teardown()
+        setIsStarting(false)
+      }
     })
 
     const unsubscribeReview = window.api.onLiveAnswerReview((event: GeminiLiveAnswerReviewEvent) => {
@@ -91,13 +151,18 @@ export default function GhostOverlay(): JSX.Element {
     })
 
     const unsubscribePanic = window.api.onPanic(() => {
+      teardown()
       setTranscripts([])
       setHintsResult(null)
+      setIsStarting(false)
     })
 
     return () => {
+      teardown()
       unsubscribeStealth()
       unsubscribeTranscript()
+      unsubscribeTurnFinished()
+      unsubscribeTranslation()
       unsubscribeConn()
       unsubscribeReview()
       unsubscribePanic()
@@ -124,6 +189,72 @@ export default function GhostOverlay(): JSX.Element {
     await window.api.toggleGhostOverlay()
   }
 
+  const handleToggleInterview = async (): Promise<void> => {
+    if (connState === 'open') {
+      teardown()
+      await window.api.stopLiveSession()
+      return
+    }
+
+    if (isStarting) return
+
+    setSessionError(null)
+    setIsStarting(true)
+
+    try {
+      const hasKey = await window.api.hasApiKey()
+      if (!hasKey) {
+        setSessionError('No API key saved yet. Please add one in Settings.')
+        setIsStarting(false)
+        return
+      }
+
+      // 1. Capture system audio (Windows loopback) and optional mic
+      const captureResult = await startCapture(() => {
+        teardown()
+        void window.api.stopLiveSession()
+      })
+
+      if (!captureResult.ok) {
+        setSessionError(captureResult.error.message)
+        setIsStarting(false)
+        return
+      }
+
+      streamsRef.current = captureResult.streams
+
+      // 2. Open live Gemini Live session
+      const liveResult = await window.api.startLiveSession(DEFAULT_INTERVIEW_SETUP)
+      if (!liveResult.ok) {
+        teardown()
+        setSessionError(liveResult.error ?? 'Failed to connect live AI session.')
+        setIsStarting(false)
+        return
+      }
+
+      // 3. Connect system audio loopback stream to Gemini Live
+      const pipeline = await createAudioPipeline(captureResult.streams, {
+        onSystemChunk: (chunk, capturedAtMs) => {
+          void window.api.sendMicChunk(chunk, capturedAtMs)
+        }
+      })
+
+      pipelineRef.current = pipeline
+    } catch (err) {
+      teardown()
+      setSessionError(err instanceof Error ? err.message : 'Could not start interview.')
+    } finally {
+      setIsStarting(false)
+    }
+  }
+
+  const handleCopyText = (id: number, text: string): void => {
+    void navigator.clipboard.writeText(text).then(() => {
+      setCopiedId(id)
+      setTimeout(() => setCopiedId(null), 2000)
+    })
+  }
+
   const handleAskQuickHints = async (): Promise<void> => {
     if (!quickPrompt.trim() || hintsLoading) return
     setHintsLoading(true)
@@ -143,15 +274,58 @@ export default function GhostOverlay(): JSX.Element {
     <div
       id="ghost-overlay-root"
       style={{ opacity: stealthState.ghostOpacity }}
-      className="flex h-screen w-screen flex-col overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950/85 text-slate-100 shadow-2xl backdrop-blur-xl transition-opacity duration-150 select-none"
+      className="flex h-screen w-screen flex-col overflow-hidden rounded-xl border border-slate-700/60 bg-slate-950/90 text-slate-100 shadow-2xl backdrop-blur-xl transition-opacity duration-150 select-none"
     >
       {/* Draggable Titlebar */}
       <header
         style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
-        className="flex cursor-default items-center justify-between border-b border-slate-800/80 bg-slate-900/70 px-3 py-1.5 text-xs select-none"
+        className="flex cursor-default items-center justify-between border-b border-slate-800/80 bg-slate-900/80 px-3 py-1.5 text-xs select-none"
       >
-        <div className="flex items-center gap-2">
-          <span className="font-medium text-slate-400 text-[11px] tracking-wide">Assistant</span>
+        <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-1.5">
+            <span className="font-bold text-cyan-400 text-xs tracking-wider">GHOSTKIT</span>
+            {connState === 'open' && (
+              <span className="flex items-center gap-1 rounded bg-cyan-950/80 px-1.5 py-0.5 text-[9px] font-medium text-cyan-300 border border-cyan-700/50">
+                <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-ping" />
+                SYSTEM AUDIO
+              </span>
+            )}
+          </div>
+
+          {/* Start / Stop Interview Button in Header */}
+          <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            <button
+              type="button"
+              onClick={handleToggleInterview}
+              disabled={isStarting}
+              title={connState === 'open' ? 'Stop live interview' : 'Start live system-audio interview'}
+              className={cn(
+                'flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[11px] font-semibold transition-all shadow-md',
+                connState === 'open'
+                  ? 'bg-rose-600 hover:bg-rose-500 text-white shadow-rose-950/60 animate-pulse'
+                  : isStarting
+                  ? 'bg-amber-600/80 text-white cursor-wait'
+                  : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-950/60'
+              )}
+            >
+              {connState === 'open' ? (
+                <>
+                  <span className="h-2 w-2 rounded-full bg-white" />
+                  <span>⏹ Stop Interview</span>
+                </>
+              ) : isStarting ? (
+                <>
+                  <span className="h-2 w-2 rounded-full bg-amber-200 animate-spin" />
+                  <span>⏳ Starting…</span>
+                </>
+              ) : (
+                <>
+                  <span>▶</span>
+                  <span>Start Interview</span>
+                </>
+              )}
+            </button>
+          </div>
         </div>
 
         {/* Action Controls (No-Drag) */}
@@ -202,10 +376,24 @@ export default function GhostOverlay(): JSX.Element {
         </div>
       </header>
 
+      {/* Error alert banner */}
+      {sessionError && (
+        <div className="bg-rose-950/90 border-b border-rose-800 px-3 py-1.5 text-[11px] text-rose-200 flex items-center justify-between">
+          <span>⚠️ {sessionError}</span>
+          <button
+            type="button"
+            onClick={() => setSessionError(null)}
+            className="text-rose-400 hover:text-rose-100 font-bold ml-2 text-xs"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* Click-through alert banner */}
       {stealthState.ghostClickThrough && (
         <div className="bg-amber-500/10 border-b border-amber-500/30 px-3 py-1 text-[11px] text-amber-300 flex items-center justify-between">
-          <span>Click-through ON: Clicks pass to windows behind. Press <b>{GHOST_CLICKTHROUGH_HOTKEY_LABEL}</b> to restore clicks.</span>
+          <span>Click-through ON: Clicks pass through. Press <b>{GHOST_CLICKTHROUGH_HOTKEY_LABEL}</b> to restore clicks.</span>
           <button
             type="button"
             onClick={handleToggleClickThrough}
@@ -217,24 +405,24 @@ export default function GhostOverlay(): JSX.Element {
       )}
 
       {/* Navigation tabs */}
-      <nav className="flex items-center justify-between border-b border-slate-800/60 bg-slate-900/40 px-3 py-1 text-xs">
+      <nav className="flex items-center justify-between border-b border-slate-800/60 bg-slate-900/50 px-3 py-1 text-xs">
         <div className="flex gap-2">
           <button
             type="button"
             onClick={() => setActiveTab('live')}
             className={cn(
-              'px-2 py-0.5 font-medium transition-colors rounded text-xs',
+              'px-2.5 py-1 font-medium transition-colors rounded text-xs flex items-center gap-1.5',
               activeTab === 'live' ? 'bg-cyan-500/20 text-cyan-300 font-semibold' : 'text-slate-400 hover:text-slate-200'
             )}
           >
             Live Assist
-            {connState === 'open' && <span className="ml-1.5 inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />}
+            {connState === 'open' && <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping" />}
           </button>
           <button
             type="button"
             onClick={() => setActiveTab('hints')}
             className={cn(
-              'px-2 py-0.5 font-medium transition-colors rounded text-xs',
+              'px-2.5 py-1 font-medium transition-colors rounded text-xs',
               activeTab === 'hints' ? 'bg-cyan-500/20 text-cyan-300 font-semibold' : 'text-slate-400 hover:text-slate-200'
             )}
           >
@@ -244,7 +432,7 @@ export default function GhostOverlay(): JSX.Element {
             type="button"
             onClick={() => setActiveTab('notes')}
             className={cn(
-              'px-2 py-0.5 font-medium transition-colors rounded text-xs',
+              'px-2.5 py-1 font-medium transition-colors rounded text-xs',
               activeTab === 'notes' ? 'bg-cyan-500/20 text-cyan-300 font-semibold' : 'text-slate-400 hover:text-slate-200'
             )}
           >
@@ -262,36 +450,78 @@ export default function GhostOverlay(): JSX.Element {
         {activeTab === 'live' && (
           <div className="flex flex-col gap-2.5">
             {transcripts.length === 0 && (
-              <div className="flex flex-col items-center justify-center py-6 text-center text-slate-400">
-                <span className="text-2xl mb-1">🎧</span>
-                <p className="font-medium text-slate-300">Live AI Assistant Ready</p>
-                <p className="text-[11px] text-slate-500 mt-1 max-w-xs">
+              <div className="flex flex-col items-center justify-center py-8 text-center text-slate-400">
+                <span className="text-3xl mb-2">🎧</span>
+                <p className="font-semibold text-slate-200 text-sm">GhostKit AI Live Copilot</p>
+                <p className="text-[11px] text-slate-400 mt-1 max-w-xs leading-normal">
                   {connState === 'open'
-                    ? 'Session is live! Interviewer & candidate speech will appear here.'
-                    : 'Start an interview in MockPilot to stream real-time transcripts & answers.'}
+                    ? 'Listening to live system audio conversation! Live transcription & on-screen text answers will stream here.'
+                    : 'Click "Start Interview" above to capture live system audio and receive instant on-screen solutions.'}
                 </p>
+                {connState !== 'open' && (
+                  <button
+                    type="button"
+                    onClick={handleToggleInterview}
+                    disabled={isStarting}
+                    className="mt-3 rounded-md bg-emerald-600 px-4 py-1.5 text-xs font-semibold text-white shadow hover:bg-emerald-500"
+                  >
+                    ▶ Start Interview Assist
+                  </button>
+                )}
               </div>
             )}
 
-            {transcripts.map((t) => (
-              <div
-                key={t.id}
-                className={cn(
-                  'rounded-lg p-2.5 text-xs',
-                  t.speaker === 'interviewer'
-                    ? 'border border-cyan-800/50 bg-cyan-950/40 text-cyan-100'
-                    : 'border border-slate-800 bg-slate-900/60 text-slate-200'
-                )}
-              >
-                <div className="flex items-center justify-between font-semibold text-[10px] uppercase tracking-wider mb-1 opacity-80">
-                  <span className={t.speaker === 'interviewer' ? 'text-cyan-400' : 'text-slate-400'}>
-                    {t.speaker === 'interviewer' ? 'Interviewer' : 'You'}
-                  </span>
-                  {!t.finished && <span className="text-[9px] text-amber-400 animate-pulse">speaking…</span>}
+            {transcripts.map((t) => {
+              const isInterviewer = t.speaker === 'interviewer'
+              const isAssistant = t.speaker === 'assistant'
+              return (
+                <div
+                  key={t.id}
+                  className={cn(
+                    'group relative rounded-lg p-3 text-xs transition-all shadow-md',
+                    isInterviewer
+                      ? 'border border-cyan-800/60 bg-cyan-950/40 text-cyan-50'
+                      : isAssistant
+                      ? 'border border-purple-600/60 bg-gradient-to-br from-purple-950/60 via-slate-900/80 to-slate-950/90 text-purple-100 shadow-purple-950/30'
+                      : 'border border-slate-800 bg-slate-900/60 text-slate-200'
+                  )}
+                >
+                  <div className="flex items-center justify-between font-semibold text-[10px] uppercase tracking-wider mb-1.5 opacity-90">
+                    <span
+                      className={cn(
+                        'flex items-center gap-1.5',
+                        isInterviewer ? 'text-cyan-400' : isAssistant ? 'text-purple-300 font-bold' : 'text-slate-400'
+                      )}
+                    >
+                      {isInterviewer && <span>🎧 Interviewer (System Audio)</span>}
+                      {isAssistant && <span>⚡ GhostKit AI (Response)</span>}
+                      {!isInterviewer && !isAssistant && <span>Candidate</span>}
+                    </span>
+
+                    <div className="flex items-center gap-1.5">
+                      {!t.finished && (
+                        <span className="flex items-center gap-1 text-[9px] text-amber-400 animate-pulse">
+                          <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                          {isInterviewer ? 'listening…' : 'generating…'}
+                        </span>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => handleCopyText(t.id, t.text)}
+                        title="Copy text"
+                        className="opacity-0 group-hover:opacity-100 transition-opacity rounded bg-slate-800/80 px-1.5 py-0.5 text-[9px] text-slate-300 hover:text-white"
+                      >
+                        {copiedId === t.id ? 'Copied ✓' : 'Copy'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="whitespace-pre-wrap leading-relaxed font-sans text-[12px] select-text">
+                    {t.text}
+                  </div>
                 </div>
-                <div className="whitespace-pre-wrap">{t.text}</div>
-              </div>
-            ))}
+              )
+            })}
 
             {latestReview && (latestReview.score !== undefined || latestReview.improvedAnswer) && (
               <div className="mt-2 rounded-lg border border-purple-800/60 bg-purple-950/30 p-2.5">

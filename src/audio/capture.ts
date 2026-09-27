@@ -108,21 +108,26 @@ async function doStart(onEnded?: (source: CaptureSource) => void): Promise<Captu
     return { ok: false, error: { kind: 'cancelled', message: 'Capture was stopped before it finished starting.' } }
   }
 
+  // Attempt mic capture as a secondary input / meter, but do not fail system audio capture if mic is absent
+  let micStream: MediaStream
   const micResult = await captureMic()
-  if (!micResult.ok) {
-    stopStream(systemResult.stream)
-    return micResult
+  if (micResult.ok) {
+    micStream = micResult.stream
+    attachEndedListener(micStream, 'mic', onEnded)
+  } else {
+    console.warn('[capture] Microphone capture was unavailable, proceeding with system audio only:', micResult.error.message)
+    micStream = new MediaStream()
   }
+
   if (cancelRequested) {
     stopStream(systemResult.stream)
-    stopStream(micResult.stream)
+    stopStream(micStream)
     return { ok: false, error: { kind: 'cancelled', message: 'Capture was stopped before it finished starting.' } }
   }
 
   attachEndedListener(systemResult.stream, 'system', onEnded)
-  attachEndedListener(micResult.stream, 'mic', onEnded)
 
-  activeStreams = { system: systemResult.stream, mic: micResult.stream }
+  activeStreams = { system: systemResult.stream, mic: micStream }
   return { ok: true, streams: activeStreams }
 }
 
@@ -155,8 +160,17 @@ async function captureSystemAudio(): Promise<StreamResult> {
   let stream: MediaStream
   try {
     // Windows loopback audio capture requires requesting video alongside it;
-    // the video track is discarded immediately below.
-    stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true })
+    // the video track is discarded immediately below. We explicitly disable
+    // echoCancellation, noiseSuppression, and autoGainControl so Chromium does not
+    // destroy or cancel out the system loopback audio from Windows meetings.
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      audio: {
+        autoGainControl: false,
+        echoCancellation: false,
+        noiseSuppression: false
+      },
+      video: true
+    })
   } catch (err) {
     return { ok: false, error: classifyDisplayMediaError(err) }
   }
@@ -203,7 +217,9 @@ function classifyDisplayMediaError(err: unknown): CaptureError {
       return {
         kind: 'system-audio-permission-denied',
         message:
-          'System audio capture was denied, cancelled, or no screen source was available. Check screen-share permissions and try again.'
+          'System audio capture could not start. Make sure this window is focused when you click Start, ' +
+          'that your screen is unlocked, and that you are not on Remote Desktop or a VM with no local display ' +
+          '(loopback audio needs an active screen). Then try again. See the app log for the exact cause.'
       }
     case 'NotFoundError':
       return {

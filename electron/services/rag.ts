@@ -43,7 +43,7 @@ import { describeGeminiError } from './gemini'
 import * as usage from './usage'
 import { redact } from '../lib/redact'
 import { INTERVIEW_ROLE_LABELS, MAX_JD_TEXT_CHARS, MAX_RESUME_PDF_BYTES } from '../ipc-types'
-import type { InterviewRole, RagIndexResult, RagStatusResult, OperationResult } from '../ipc-types'
+import type { InterviewRole, RagIndexResult, RagStatusResult, OperationResult, QaBankEntry, QaBankIndexResult, QaBankStatusResult } from '../ipc-types'
 
 /**
  * Embedding model + fixed output dimensionality. gemini-embedding-001
@@ -71,6 +71,20 @@ const EMBED_TIMEOUT_MS = 8000
 
 /** Top-k chunks returned per source at retrieval time. */
 const TOP_K = 4
+
+/**
+ * Top-k prepared Q&A pairs returned at retrieval time -- deliberately much
+ * higher than resume/JD's TOP_K: this content is a user-curated list of
+ * questions they specifically expect for THIS interview, not a large
+ * document to summarize down to a handful of representative chunks. For a
+ * typical list (well under this count), `LIMIT 20` just returns everything
+ * stored, in whatever order the KNN scan happens to produce -- the cap only
+ * actually filters once a list grows past it, keeping the prompt bounded.
+ */
+const QA_TOP_K = 20
+
+/** Analogous to MAX_PROMPT_CHUNK_CHARS but sized for the qa bank specifically -- prepared Q&A pairs are the highest-value content in the prompt (an exact vetted answer beats anything generated from scratch), so this gets a larger budget. */
+const MAX_QA_PROMPT_CHARS = 8000
 
 /** Rough per-chunk target (a token is ~0.75 words, so 300 words ~= 400 tokens). */
 const CHUNK_TARGET_WORDS = 300
@@ -148,6 +162,20 @@ function getDb(): Database.Database {
       text TEXT NOT NULL
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS jd_vectors USING vec0(embedding float[${EMBED_DIM}]);
+    CREATE TABLE IF NOT EXISTS qa_items (
+      id INTEGER PRIMARY KEY,
+      item_index INTEGER NOT NULL,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS qa_vectors USING vec0(embedding float[${EMBED_DIM}]);
+    CREATE TABLE IF NOT EXISTS learned_qa_items (
+      id INTEGER PRIMARY KEY,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS learned_qa_vectors USING vec0(embedding float[${EMBED_DIM}]);
   `)
   db = instance
   return db
@@ -627,4 +655,310 @@ async function retrieveTopChunks(
 
   const joined = rows.map((row) => row.text).join('\n\n---\n\n')
   return joined.length > MAX_PROMPT_CHUNK_CHARS ? `${joined.slice(0, MAX_PROMPT_CHUNK_CHARS)}…` : joined
+}
+
+// ---------------------------------------------------------------------------
+// Prepared Q&A bank: a candidate-curated list of {question, answer} pairs
+// for THIS interview (e.g. common questions for the role, with the exact
+// answer they want used). Stored/retrieved the same way as resume/JD (embed
+// -> vec0 -> KNN at session start), but as its own source with its own
+// schema (a question/answer pair, not a single text blob) and its own
+// bulk-replace/clear/status functions -- distinct from clearMaterials/
+// getStatus/indexMaterials above, which only ever touch resume/jd.
+// ---------------------------------------------------------------------------
+
+function formatQaEntry(question: string, answer: string): string {
+  return `Q: ${question}\nA: ${answer}`
+}
+
+/**
+ * Replaces the entire stored Q&A bank with `entries` (same "full replace"
+ * semantics as indexMaterials -- a fresh save always fully overwrites
+ * whatever was there before, never accumulates duplicates across saves). An
+ * empty list clears the bank. Embeds each entry's QUESTION text only (that's
+ * what a retrieval query -- and, in spirit, the interviewer's own question --
+ * is matched against; the answer text along for the ride is never itself
+ * embedded).
+ */
+export async function indexQaBank(entries: QaBankEntry[]): Promise<QaBankIndexResult> {
+  if (entries.length === 0) {
+    const cleared = clearQaBank()
+    return cleared.ok ? { ok: true, count: 0 } : { ok: false, error: cleared.error }
+  }
+
+  const apiKey = await getApiKey()
+  if (apiKey === null || apiKey.length === 0) {
+    return { ok: false, error: 'No API key saved yet. Add one in Settings first.' }
+  }
+
+  let vectors: number[][]
+  try {
+    vectors = await embedTexts(apiKey, entries.map((e) => e.question), 'RETRIEVAL_DOCUMENT')
+  } catch (err) {
+    return { ok: false, error: describeGeminiError(err) }
+  }
+
+  let instance: Database.Database
+  try {
+    instance = getDb()
+  } catch (err) {
+    console.error('[rag] failed to open the local index:', redact(String(err)))
+    return { ok: false, error: 'Could not access the local search index.' }
+  }
+
+  try {
+    const tx = instance.transaction(() => {
+      instance.prepare('DELETE FROM qa_vectors').run()
+      instance.prepare('DELETE FROM qa_items').run()
+      const insertItem = instance.prepare('INSERT INTO qa_items (item_index, question, answer) VALUES (?, ?, ?)')
+      const insertVector = instance.prepare('INSERT INTO qa_vectors (rowid, embedding) VALUES (?, ?)')
+      entries.forEach((entry, index) => {
+        const info = insertItem.run(index, entry.question, entry.answer)
+        // BigInt rowid -- see writeSourceChunks's comment on the identical requirement.
+        insertVector.run(BigInt(info.lastInsertRowid), JSON.stringify(vectors[index]))
+      })
+    })
+    tx()
+  } catch (err) {
+    console.error('[rag] failed to store the qa bank in the local index:', redact(String(err)))
+    return { ok: false, error: 'Could not save to the local search index.' }
+  }
+
+  return { ok: true, count: entries.length }
+}
+
+/** Current qa bank entry count, mirroring getStatus()'s resume/jd readout. Never throws. */
+export function getQaBankStatus(): QaBankStatusResult {
+  try {
+    const instance = getDb()
+    const count = (instance.prepare('SELECT COUNT(*) AS c FROM qa_items').get() as { c: number }).c
+    return { count }
+  } catch (err) {
+    console.error('[rag] failed to read qa bank status:', redact(String(err)))
+    return { count: 0 }
+  }
+}
+
+/** Deletes the entire stored qa bank. Mirrors clearMaterials(); a separate function/button from it since the qa bank is a distinct source the candidate manages independently of resume/JD. */
+export function clearQaBank(): OperationResult {
+  try {
+    const instance = getDb()
+    const tx = instance.transaction(() => {
+      instance.prepare('DELETE FROM qa_vectors').run()
+      instance.prepare('DELETE FROM qa_items').run()
+    })
+    tx()
+    instance.pragma('wal_checkpoint(TRUNCATE)')
+    return { ok: true }
+  } catch (err) {
+    console.error('[rag] failed to clear the qa bank:', redact(String(err)))
+    return { ok: false, error: 'Could not clear the local search index.' }
+  }
+}
+
+/**
+ * Retrieves up to QA_TOP_K prepared Q&A pairs, using the same role-based
+ * proxy-query approach as retrieveChunks (see that function's doc comment --
+ * there is no candidate-specific question yet at session-start time). `null`
+ * if nothing is stored, no key, or retrieval fails for any reason -- the
+ * caller (geminiLive.ts) falls back to "none provided" prompt text rather
+ * than blocking interview start.
+ */
+export async function retrieveQaBank(role: InterviewRole, usageToken: number | null = null): Promise<string | null> {
+  try {
+    const instance = getDb()
+    const count = (instance.prepare('SELECT COUNT(*) AS c FROM qa_items').get() as { c: number }).c
+    if (count === 0) return null
+
+    const apiKey = await getApiKey()
+    if (apiKey === null || apiKey.length === 0) return null
+
+    const roleLabel = INTERVIEW_ROLE_LABELS[role]
+    const vectors = await embedTexts(
+      apiKey,
+      [`Interview questions and prepared answers relevant to a ${roleLabel} role.`],
+      'RETRIEVAL_QUERY',
+      usageToken
+    )
+    const queryVector = vectors[0]
+    if (queryVector === undefined) return null
+
+    const rows = instance
+      .prepare(
+        `SELECT i.question AS question, i.answer AS answer
+         FROM qa_items i
+         JOIN (
+           SELECT rowid, distance FROM qa_vectors WHERE embedding MATCH ? ORDER BY distance LIMIT ?
+         ) v ON v.rowid = i.id
+         ORDER BY v.distance`
+      )
+      .all(JSON.stringify(queryVector), QA_TOP_K) as Array<{ question: string; answer: string }>
+
+    if (rows.length === 0) return null
+
+    const joined = rows.map((row) => formatQaEntry(row.question, row.answer)).join('\n\n')
+    return joined.length > MAX_QA_PROMPT_CHARS ? `${joined.slice(0, MAX_QA_PROMPT_CHARS)}…` : joined
+  } catch (err) {
+    console.error('[rag] qa bank retrieval failed:', redact(String(err)))
+    return null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Learned answer cache: unlike the qa bank above (which the CANDIDATE
+// curates), this is filled automatically -- every question actually
+// answered live gets embedded and stored here, so a common question (either
+// later in the SAME interview, or in a FUTURE one) can be answered from a
+// local vector lookup instead of a fresh Gemini call. A local KNN query is a
+// few tens of ms; a fresh generateContentStream call is multiple SECONDS
+// (see geminiLive.ts's ANSWER_TIMEOUT_MS/runFastTextAnswer) -- so a cache hit
+// is a large, direct latency win, not just a cost one.
+//
+// The risk this module has to manage carefully: a WRONG cache hit -- serving
+// a cached answer for a question that only superficially resembles the
+// cached one -- reproduces the exact "answer doesn't match the question"
+// class of bug this app already went through several rounds fixing
+// elsewhere (see geminiLive.ts's answerQueue/INTERVIEWER_SILENCE_FLUSH_MS
+// doc comments). LEARNED_MATCH_MAX_DISTANCE below is deliberately
+// conservative for that reason -- callers should treat "no match under the
+// threshold" as the expected common case, not a failure, and always have a
+// live-generation fallback ready (see geminiLive.ts's flushInterviewerTurn).
+// ---------------------------------------------------------------------------
+
+/** Caps how many learned answers accumulate -- KNN search cost grows with row count, and an interview only ever asks so many distinct questions; a few hundred is already generous cross-session reuse. Oldest entries are evicted first once this is exceeded. */
+const MAX_LEARNED_QA = 500
+
+/**
+ * L2 distance cutoff (sqlite-vec's default metric for a plain `float[N]`
+ * vec0 column, gemini-embedding-001 embeddings, unnormalized) below which a
+ * cached answer is considered a safe reuse. NOT empirically calibrated
+ * against real interview question pairs yet -- deliberately set tight
+ * (near-duplicate/paraphrase level, not "same general topic") to bias hard
+ * toward false negatives (an unnecessary fresh generation) over false
+ * positives (a wrong cached answer shown as fact). `findLearnedAnswer`
+ * always logs the matched question + its distance on every lookup, hit or
+ * miss, specifically so this threshold can be tuned against real numbers
+ * instead of guessed twice.
+ */
+const LEARNED_MATCH_MAX_DISTANCE = 0.3
+
+/**
+ * Embeds `question` and stores it + `answer` in the learned cache,
+ * fire-and-forget from the caller (geminiLive.ts, right after a fresh
+ * answer finishes generating successfully). Evicts the oldest row(s) first
+ * if this would exceed MAX_LEARNED_QA. Never throws -- a failure here must
+ * never affect the live interview that's already moved on.
+ */
+export async function cacheLearnedAnswer(question: string, answer: string): Promise<void> {
+  try {
+    const apiKey = await getApiKey()
+    if (apiKey === null || apiKey.length === 0) return
+
+    const vectors = await embedTexts(apiKey, [question], 'RETRIEVAL_DOCUMENT')
+    const vector = vectors[0]
+    if (vector === undefined) return
+
+    const instance = getDb()
+    const tx = instance.transaction(() => {
+      const count = (instance.prepare('SELECT COUNT(*) AS c FROM learned_qa_items').get() as { c: number }).c
+      const overBy = count + 1 - MAX_LEARNED_QA
+      if (overBy > 0) {
+        const stale = instance.prepare('SELECT id FROM learned_qa_items ORDER BY created_at ASC LIMIT ?').all(overBy) as Array<{ id: number }>
+        const deleteVector = instance.prepare('DELETE FROM learned_qa_vectors WHERE rowid = ?')
+        const deleteItem = instance.prepare('DELETE FROM learned_qa_items WHERE id = ?')
+        for (const row of stale) {
+          deleteVector.run(BigInt(row.id))
+          deleteItem.run(row.id)
+        }
+      }
+      const info = instance.prepare('INSERT INTO learned_qa_items (question, answer, created_at) VALUES (?, ?, ?)').run(question, answer, Date.now())
+      instance.prepare('INSERT INTO learned_qa_vectors (rowid, embedding) VALUES (?, ?)').run(BigInt(info.lastInsertRowid), JSON.stringify(vector))
+    })
+    tx()
+  } catch (err) {
+    console.error('[rag] failed to cache a learned answer:', redact(String(err)))
+  }
+}
+
+export interface LearnedAnswerMatch {
+  question: string
+  answer: string
+}
+
+/**
+ * Looks up the closest learned answer to `question`, returning it only if
+ * the match is within LEARNED_MATCH_MAX_DISTANCE -- otherwise `null`, which
+ * callers should treat as the normal case, not an error. Never throws (no
+ * key, no cache yet, embedding failure, ...) -- always resolves to `null` on
+ * any failure so a lookup can never block/break the live-generation
+ * fallback.
+ */
+export async function findLearnedAnswer(question: string, usageToken: number | null = null): Promise<LearnedAnswerMatch | null> {
+  try {
+    const instance = getDb()
+    const count = (instance.prepare('SELECT COUNT(*) AS c FROM learned_qa_items').get() as { c: number }).c
+    if (count === 0) return null
+
+    const apiKey = await getApiKey()
+    if (apiKey === null || apiKey.length === 0) return null
+
+    const vectors = await embedTexts(apiKey, [question], 'RETRIEVAL_QUERY', usageToken)
+    const queryVector = vectors[0]
+    if (queryVector === undefined) return null
+
+    const row = instance
+      .prepare(
+        `SELECT i.question AS question, i.answer AS answer, v.distance AS distance
+         FROM learned_qa_items i
+         JOIN (
+           SELECT rowid, distance FROM learned_qa_vectors WHERE embedding MATCH ? ORDER BY distance LIMIT 1
+         ) v ON v.rowid = i.id`
+      )
+      .get(JSON.stringify(queryVector)) as { question: string; answer: string; distance: number } | undefined
+
+    if (row === undefined) return null
+
+    // Logged unconditionally (hit or miss) -- see LEARNED_MATCH_MAX_DISTANCE's
+    // doc comment: this is how that threshold gets tuned against real data
+    // instead of guessed.
+    const hit = row.distance <= LEARNED_MATCH_MAX_DISTANCE
+    console.log(
+      `[rag][timing] learned-answer lookup: closest match "${row.question.slice(0, 50)}" distance=${row.distance.toFixed(4)} threshold=${LEARNED_MATCH_MAX_DISTANCE} -> ${hit ? 'HIT' : 'miss'}`
+    )
+    if (!hit) return null
+
+    return { question: row.question, answer: row.answer }
+  } catch (err) {
+    console.error('[rag] learned-answer lookup failed:', redact(String(err)))
+    return null
+  }
+}
+
+/** Current learned-cache entry count, for display. Never throws. */
+export function getLearnedAnswerStatus(): { count: number } {
+  try {
+    const instance = getDb()
+    const count = (instance.prepare('SELECT COUNT(*) AS c FROM learned_qa_items').get() as { c: number }).c
+    return { count }
+  } catch (err) {
+    console.error('[rag] failed to read learned-answer cache status:', redact(String(err)))
+    return { count: 0 }
+  }
+}
+
+/** Deletes the entire learned-answer cache. The only way to remove it -- e.g. if a wrong cached answer ever gets reused, this is the escape hatch while LEARNED_MATCH_MAX_DISTANCE is still being tuned. */
+export function clearLearnedAnswers(): OperationResult {
+  try {
+    const instance = getDb()
+    const tx = instance.transaction(() => {
+      instance.prepare('DELETE FROM learned_qa_vectors').run()
+      instance.prepare('DELETE FROM learned_qa_items').run()
+    })
+    tx()
+    instance.pragma('wal_checkpoint(TRUNCATE)')
+    return { ok: true }
+  } catch (err) {
+    console.error('[rag] failed to clear the learned-answer cache:', redact(String(err)))
+    return { ok: false, error: 'Could not clear the local search index.' }
+  }
 }

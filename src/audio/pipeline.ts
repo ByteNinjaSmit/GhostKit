@@ -58,19 +58,33 @@ export interface AudioPipelineHandle {
 
 export interface AudioPipelineOptions {
   /**
-   * Called once per mic PCM16 chunk (100ms, 16kHz mono) as it arrives from
-   * the worklet. Optional -- Phase 1 callers (or a pipeline started before a
-   * live session exists) can omit it and just get the chunk counter. Never
-   * called for system-audio chunks.
+   * Called once per system-audio PCM16 chunk (100ms, 16kHz mono) as it
+   * arrives from the worklet. This is the primary input forwarded to Gemini
+   * Live. `capturedAtMs` is `Date.now()` at the moment this callback fires --
+   * as close to "the renderer just got this chunk" as JS can observe (not
+   * the exact audio-sample instant, which is ~100ms earlier due to the
+   * worklet's own buffering -- that offset is expected/constant, not
+   * end-to-end pipeline latency). Callers use it purely for latency logging
+   * (see geminiLive.ts's `sendAudioChunk`), never functionally.
    */
-  onMicChunk?: (chunk: ArrayBuffer) => void
+  onSystemChunk?: (chunk: ArrayBuffer, capturedAtMs: number) => void
+  /**
+   * Called once per mic PCM16 chunk (100ms, 16kHz mono) as it arrives from
+   * the worklet. Optional. Same `capturedAtMs` semantics as `onSystemChunk`.
+   */
+  onMicChunk?: (chunk: ArrayBuffer, capturedAtMs: number) => void
 }
 
 export async function createAudioPipeline(
   streams: CaptureStreams,
   options: AudioPipelineOptions = {}
 ): Promise<AudioPipelineHandle> {
-  const audioContext = new AudioContext()
+  let audioContext: AudioContext
+  try {
+    audioContext = new AudioContext({ sampleRate: 16000 })
+  } catch {
+    audioContext = new AudioContext()
+  }
 
   let workletActive = true
   try {
@@ -90,7 +104,7 @@ export async function createAudioPipeline(
 
   try {
     const mic = createTap(audioContext, streams.mic, workletActive, silentSink, options.onMicChunk)
-    const system = createTap(audioContext, streams.system, workletActive, silentSink)
+    const system = createTap(audioContext, streams.system, workletActive, silentSink, options.onSystemChunk)
 
     if (audioContext.state === 'suspended') {
       await audioContext.resume().catch(() => {
@@ -136,38 +150,39 @@ function createTap(
   stream: MediaStream,
   workletActive: boolean,
   silentSink: MediaStreamAudioDestinationNode,
-  onChunk?: (chunk: ArrayBuffer) => void
+  onChunk?: (chunk: ArrayBuffer, capturedAtMs: number) => void
 ): Tap {
-  const source = audioContext.createMediaStreamSource(stream)
-
+  const hasTracks = stream.getAudioTracks().length > 0
   const analyser = audioContext.createAnalyser()
   analyser.fftSize = 1024
   analyser.smoothingTimeConstant = 0.6
   const levelBuffer = new Uint8Array(analyser.fftSize)
 
-  source.connect(analyser)
-  analyser.connect(silentSink)
-
   const chunkCount = { count: 0 }
+  let source: MediaStreamAudioSourceNode | null = null
   let workletNode: AudioWorkletNode | null = null
-  if (workletActive) {
-    workletNode = new AudioWorkletNode(audioContext, WORKLET_NAME, {
-      channelCount: 1,
-      channelCountMode: 'explicit'
-    })
-    workletNode.port.onmessage = (event: MessageEvent<unknown>): void => {
-      if (event.data instanceof ArrayBuffer) {
-        chunkCount.count += 1
-        onChunk?.(event.data)
-      } else {
-        // The worklet posts a plain object instead of an ArrayBuffer only to
-        // report a problem (e.g. an unsupported native sample rate) -- see
-        // pcm-worklet.js.
-        console.warn('[pipeline] PCM worklet reported a problem:', event.data)
+
+  if (hasTracks) {
+    source = audioContext.createMediaStreamSource(stream)
+    source.connect(analyser)
+    analyser.connect(silentSink)
+
+    if (workletActive) {
+      workletNode = new AudioWorkletNode(audioContext, WORKLET_NAME, {
+        channelCount: 1,
+        channelCountMode: 'explicit'
+      })
+      workletNode.port.onmessage = (event: MessageEvent<unknown>): void => {
+        if (event.data instanceof ArrayBuffer) {
+          chunkCount.count += 1
+          onChunk?.(event.data, Date.now())
+        } else {
+          console.warn('[pipeline] PCM worklet reported a problem:', event.data)
+        }
       }
+      source.connect(workletNode)
+      workletNode.connect(silentSink)
     }
-    source.connect(workletNode)
-    workletNode.connect(silentSink)
   }
 
   return {
@@ -175,7 +190,7 @@ function createTap(
     levelBuffer,
     chunkCount,
     disconnect: () => {
-      source.disconnect()
+      source?.disconnect()
       analyser.disconnect()
       if (workletNode) {
         workletNode.port.onmessage = null

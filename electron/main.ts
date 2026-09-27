@@ -20,6 +20,9 @@ import {
   HISTORY_MAX_PAGE_SIZE,
   HISTORY_MAX_OFFSET,
   HISTORY_MAX_WEAK_AREAS,
+  MAX_QA_ENTRIES,
+  MAX_QA_QUESTION_CHARS,
+  MAX_QA_ANSWER_CHARS,
   parseFocusTopics
 } from './ipc-types'
 import type {
@@ -34,6 +37,10 @@ import type {
   InterviewRole,
   InterviewSetup,
   OperationResult,
+  QaBankEntry,
+  QaBankIndexResult,
+  QaBankStatusResult,
+  LearnedAnswerStatusResult,
   RagIndexResult,
   RagStatusResult,
   RunCodeResult,
@@ -194,6 +201,22 @@ function toRagIndexRequest(value: unknown): { resumePdfBytes: ArrayBuffer | null
   }
 }
 
+/** Validates a `QA_BANK_INDEX` payload: an array of {question, answer} pairs, each within length bounds, the whole list within MAX_QA_ENTRIES. The actual bounds are re-enforced inside rag.ts's own callers too (defense in depth), but this is the IPC-boundary shape/type check, same posture as `toRagIndexRequest`. */
+function toQaBankEntries(value: unknown): QaBankEntry[] | null {
+  if (!Array.isArray(value) || value.length > MAX_QA_ENTRIES) return null
+  const entries: QaBankEntry[] = []
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) return null
+    const v = item as Record<string, unknown>
+    const question = v['question']
+    const answer = v['answer']
+    if (typeof question !== 'string' || question.trim().length === 0 || question.length > MAX_QA_QUESTION_CHARS) return null
+    if (typeof answer !== 'string' || answer.trim().length === 0 || answer.length > MAX_QA_ANSWER_CHARS) return null
+    entries.push({ question: question.trim(), answer: answer.trim() })
+  }
+  return entries
+}
+
 const CODING_LANGUAGE_SET: ReadonlySet<string> = new Set(CODING_LANGUAGES)
 
 /** Validates a `CODING_RUN_CODE` payload. The actual char-length cap is re-enforced inside codeRunner.ts itself -- this is only the shape/type check at the IPC boundary, same pattern as `toRagIndexRequest`. */
@@ -248,14 +271,8 @@ let ghostOverlayWindow: BrowserWindow | null = null
 let savedOverlayBounds: { x: number; y: number; width: number; height: number } | null = null
 
 let stealthAlwaysOnTop = false
-// Default ON: the main window ships without a taskbar button, which (a) keeps it
-// off the taskbar/Alt-Tab and (b) makes Windows Task Manager list the process
-// under "Background processes" rather than "Apps". This does NOT hide the
-// process -- it stays fully visible and named in Task Manager (and flat in the
-// Details tab). Because there's no taskbar/Alt-Tab entry, the window is summoned
-// with MAIN_WINDOW_HOTKEY (see below). Toggle it off in Settings if you want the
-// normal taskbar button back.
-let stealthSkipTaskbar = true
+// Default OFF so the window is visible in taskbar and Alt-Tab.
+let stealthSkipTaskbar = false
 let ghostClickThrough = false
 let ghostOpacity = 0.95
 
@@ -297,7 +314,9 @@ const liveEventSink: geminiLive.GeminiLiveEventSink = {
   onAudioChunk: (event) => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_AUDIO_CHUNK, event),
   onConnectionState: (event) => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_CONNECTION_STATE, event),
   onInterrupted: () => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_INTERRUPTED, null),
-  onAnswerReview: (event) => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_ANSWER_REVIEW, event)
+  onAnswerReview: (event) => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_ANSWER_REVIEW, event),
+  onTurnFinished: (event) => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_TURN_FINISHED, event),
+  onInterviewerTranslation: (event) => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_TRANSLATION, event)
 }
 
 // ---------------------------------------------------------------------------
@@ -576,12 +595,24 @@ function createMainWindow(): BrowserWindow {
       // communication goes through the typed contextBridge API in preload.ts.
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      // Chromium throttles a background/unfocused window's JS execution
+      // (timers, and -- the part that matters here -- how promptly it
+      // actually paints a DOM update) by default. This window's entire job
+      // during a live interview is to keep updating a live transcript while
+      // the candidate is looking at their call window, not this one -- so it
+      // is almost always unfocused exactly when it matters most. Confirmed
+      // main-process-side that pushed transcript events are instant (see
+      // geminiLive.ts's timing logs); a throttled renderer only APPEARING to
+      // lag behind that, despite the data already being there, is the
+      // remaining unexplained gap the user kept reporting (2026-09-27).
+      backgroundThrottling: false
     }
   })
 
   win.once('ready-to-show', () => {
     win.show()
+    win.focus()
   })
 
   // Windows SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
@@ -732,7 +763,15 @@ function createGhostOverlayWindow(): BrowserWindow {
       preload: join(__dirname, '../preload/preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      // THE important one of the two backgroundThrottling: false settings in
+      // this file -- see createMainWindow's identical option for the full
+      // reasoning. This overlay's whole purpose is to sit on top of a video
+      // call while the candidate looks at THAT window, not this one, so it
+      // is essentially always the unfocused window exactly during a live
+      // interview -- the single worst case for Chromium's default background
+      // JS/paint throttling.
+      backgroundThrottling: false
     }
   })
 
@@ -855,20 +894,27 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(IPC_CHANNELS.GEMINI_LIVE_STOP, async (event): Promise<OperationResult> => {
     if (!isTrustedSender(event)) return { ok: false, error: 'Unauthorized.' }
-    return geminiLive.stopSession()
+    const result = geminiLive.stopSession()
+    sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_CONNECTION_STATE, { state: 'closed' })
+    return result
   })
 
-  ipcMain.handle(IPC_CHANNELS.GEMINI_LIVE_SEND_AUDIO, async (event, chunk: unknown): Promise<OperationResult> => {
+  ipcMain.handle(IPC_CHANNELS.GEMINI_LIVE_SEND_AUDIO, async (event, payload: unknown): Promise<OperationResult> => {
     if (!isTrustedSender(event)) return { ok: false, error: 'Unauthorized.' }
-    // Mic chunks only ever originate as an ArrayBuffer (see preload.ts) --
-    // anything else crossing this boundary is rejected outright. The actual
-    // byte-length bound (MAX_AUDIO_CHUNK_BYTES) is enforced inside
-    // geminiLive.sendAudioChunk itself, which is the single source of truth
-    // for "what a valid chunk looks like" regardless of caller.
-    if (!(chunk instanceof ArrayBuffer)) {
+    // Mic chunks only ever originate as { chunk: ArrayBuffer, capturedAtMs:
+    // number } (see preload.ts) -- anything else crossing this boundary is
+    // rejected outright. The actual byte-length bound (MAX_AUDIO_CHUNK_BYTES)
+    // is enforced inside geminiLive.sendAudioChunk itself, which is the
+    // single source of truth for "what a valid chunk looks like" regardless
+    // of caller.
+    if (typeof payload !== 'object' || payload === null) {
       return { ok: false, error: 'Invalid audio chunk.' }
     }
-    return geminiLive.sendAudioChunk(chunk)
+    const { chunk, capturedAtMs } = payload as Record<string, unknown>
+    if (!(chunk instanceof ArrayBuffer) || typeof capturedAtMs !== 'number' || !Number.isFinite(capturedAtMs)) {
+      return { ok: false, error: 'Invalid audio chunk.' }
+    }
+    return geminiLive.sendAudioChunk(chunk, capturedAtMs)
   })
 
   ipcMain.handle(IPC_CHANNELS.RAG_INDEX_MATERIALS, async (event, payload: unknown): Promise<RagIndexResult> => {
@@ -881,6 +927,33 @@ function registerIpcHandlers(): void {
   ipcMain.handle(IPC_CHANNELS.RAG_STATUS, async (event): Promise<RagStatusResult> => {
     if (!isTrustedSender(event)) return { resumeChunkCount: 0, jdChunkCount: 0 }
     return rag.getStatus()
+  })
+
+  ipcMain.handle(IPC_CHANNELS.QA_BANK_INDEX, async (event, payload: unknown): Promise<QaBankIndexResult> => {
+    if (!isTrustedSender(event)) return { ok: false, error: 'Unauthorized.' }
+    const validated = toQaBankEntries(payload)
+    if (validated === null) return { ok: false, error: 'Invalid request.' }
+    return rag.indexQaBank(validated)
+  })
+
+  ipcMain.handle(IPC_CHANNELS.QA_BANK_STATUS, async (event): Promise<QaBankStatusResult> => {
+    if (!isTrustedSender(event)) return { count: 0 }
+    return rag.getQaBankStatus()
+  })
+
+  ipcMain.handle(IPC_CHANNELS.QA_BANK_CLEAR, async (event): Promise<OperationResult> => {
+    if (!isTrustedSender(event)) return { ok: false, error: 'Unauthorized.' }
+    return rag.clearQaBank()
+  })
+
+  ipcMain.handle(IPC_CHANNELS.LEARNED_ANSWERS_STATUS, async (event): Promise<LearnedAnswerStatusResult> => {
+    if (!isTrustedSender(event)) return { count: 0 }
+    return rag.getLearnedAnswerStatus()
+  })
+
+  ipcMain.handle(IPC_CHANNELS.LEARNED_ANSWERS_CLEAR, async (event): Promise<OperationResult> => {
+    if (!isTrustedSender(event)) return { ok: false, error: 'Unauthorized.' }
+    return rag.clearLearnedAnswers()
   })
 
   ipcMain.handle(IPC_CHANNELS.RAG_CLEAR_MATERIALS, async (event): Promise<OperationResult> => {
@@ -1128,7 +1201,16 @@ void app
       }
       if (permission === 'media') {
         const mediaTypes = 'mediaTypes' in details ? (details.mediaTypes ?? []) : []
-        callback(mediaTypes.length > 0 && mediaTypes.every((type) => type === 'audio'))
+        // getDisplayMedia (Windows system-audio loopback -- src/audio/capture.ts)
+        // surfaces here as a 'media' request with an EMPTY mediaTypes array in
+        // this Chromium build. The previous `mediaTypes.length > 0` guard denied
+        // it outright, so system-audio capture failed on a perfectly normal local
+        // session (verified by probe). Allow the empty case: the real gate for
+        // screen/loopback capture is setDisplayMediaRequestHandler below (origin +
+        // user gesture + audioRequested + a real screen source). A getUserMedia
+        // request always populates mediaTypes, so those are still allowed only
+        // when audio-only -- the camera (any 'video' entry) stays denied.
+        callback(mediaTypes.length === 0 || mediaTypes.every((type) => type === 'audio'))
         return
       }
       callback(false)
@@ -1164,7 +1246,17 @@ void app
     // captures a live bitmap of every screen into main-process memory on
     // every call, which this app never uses.
     session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
-      if (!request.securityOrigin.startsWith(trustedOrigin) || !request.userGesture || !request.audioRequested) {
+      // Every early return below calls back with {} -- Chromium collapses all of
+      // them into a single NotAllowedError on the renderer's getDisplayMedia()
+      // promise, so it can't tell them apart. Log the *specific* reason here so a
+      // capture failure is diagnosable (main-process console / `npm run dev`).
+      const originOk = request.securityOrigin.startsWith(trustedOrigin)
+      if (!originOk || !request.userGesture || !request.audioRequested) {
+        console.warn(
+          `[display-media] request rejected before source lookup: originOk=${originOk} ` +
+            `userGesture=${request.userGesture} audioRequested=${request.audioRequested} ` +
+            `(securityOrigin=${redact(request.securityOrigin)})`
+        )
         callback({})
         return
       }
@@ -1176,7 +1268,15 @@ void app
             // No source to hand back. Calling back with an empty object
             // rejects the renderer's pending getDisplayMedia() promise
             // cleanly -- if callback is never invoked at all, that promise
-            // hangs forever instead.
+            // hangs forever instead. Zero screen sources typically means the
+            // screen is locked, or this is a Remote Desktop / VM / headless
+            // session with no active local display -- Windows loopback audio
+            // needs a real screen source to attach to.
+            console.warn(
+              '[display-media] desktopCapturer.getSources() returned 0 screen sources -- ' +
+                'cannot start system-audio loopback. Common causes: locked screen, ' +
+                'Remote Desktop / VM / headless session, or no active display.'
+            )
             callback({})
             return
           }
@@ -1205,6 +1305,7 @@ void app
 
     registerIpcHandlers()
     mainWindow = createMainWindow()
+    createGhostOverlayWindow()
 
     // Register global shortcuts for Ghost HUD overlay (Ctrl+Alt+G) and Click-Through (Ctrl+Alt+C)
     try {

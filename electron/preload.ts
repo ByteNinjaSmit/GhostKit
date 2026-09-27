@@ -26,7 +26,9 @@ import type {
   GeminiLiveAnswerReviewEvent,
   GeminiLiveAudioChunkEvent,
   GeminiLiveConnectionStateEvent,
+  GeminiLiveTurnFinishedEvent,
   GeminiLiveTranscriptEvent,
+  GeminiLiveTranslationEvent,
   HintsResult,
   HistoryListResult,
   HistoryReview,
@@ -40,6 +42,10 @@ import type {
   InterviewSetup,
   MockPilotApi,
   OperationResult,
+  QaBankEntry,
+  QaBankIndexResult,
+  QaBankStatusResult,
+  LearnedAnswerStatusResult,
   RagIndexResult,
   RagStatusResult,
   RunCodeResult,
@@ -176,6 +182,32 @@ function toRagStatusResult(value: unknown): RagStatusResult {
   }
 }
 
+/** Same "don't trust a bare cast" discipline, for `QA_BANK_INDEX`'s result shape. */
+function toQaBankIndexResult(value: unknown): QaBankIndexResult {
+  if (typeof value !== 'object' || value === null || typeof (value as { ok?: unknown }).ok !== 'boolean') {
+    return { ok: false, error: 'Malformed response from main process.' }
+  }
+  const v = value as Record<string, unknown>
+  const result: QaBankIndexResult = { ok: v['ok'] === true }
+  if (typeof v['error'] === 'string') result.error = v['error']
+  if (typeof v['count'] === 'number') result.count = v['count']
+  return result
+}
+
+/** Same "don't trust a bare cast" discipline, for `QA_BANK_STATUS`'s result shape. */
+function toQaBankStatusResult(value: unknown): QaBankStatusResult {
+  if (typeof value !== 'object' || value === null) return { count: 0 }
+  const v = value as Record<string, unknown>
+  return { count: typeof v['count'] === 'number' ? v['count'] : 0 }
+}
+
+/** Same "don't trust a bare cast" discipline, for `LEARNED_ANSWERS_STATUS`'s result shape. */
+function toLearnedAnswerStatusResult(value: unknown): LearnedAnswerStatusResult {
+  if (typeof value !== 'object' || value === null) return { count: 0 }
+  const v = value as Record<string, unknown>
+  return { count: typeof v['count'] === 'number' ? v['count'] : 0 }
+}
+
 /**
  * Validates a main->renderer push payload before it ever reaches a
  * subscriber's callback. `ipcRenderer.on` hands back `unknown` in spirit
@@ -189,10 +221,28 @@ function toRagStatusResult(value: unknown): RagStatusResult {
 function toLiveTranscriptEvent(value: unknown): GeminiLiveTranscriptEvent | null {
   if (typeof value !== 'object' || value === null) return null
   const v = value as Record<string, unknown>
-  if ((v['speaker'] !== 'user' && v['speaker'] !== 'interviewer') || typeof v['textDelta'] !== 'string' || typeof v['finished'] !== 'boolean') {
+  if ((v['speaker'] !== 'user' && v['speaker'] !== 'interviewer' && v['speaker'] !== 'assistant') || typeof v['textDelta'] !== 'string' || typeof v['finished'] !== 'boolean') {
     return null
   }
-  return { speaker: v['speaker'], textDelta: v['textDelta'], finished: v['finished'] }
+  return { speaker: v['speaker'] as GeminiLiveTranscriptEvent['speaker'], textDelta: v['textDelta'], finished: v['finished'] }
+}
+
+function toLiveTurnFinishedEvent(value: unknown): GeminiLiveTurnFinishedEvent | null {
+  if (typeof value !== 'object' || value === null) return null
+  const v = value as Record<string, unknown>
+  if (v['speaker'] !== 'user' && v['speaker'] !== 'interviewer' && v['speaker'] !== 'assistant') return null
+  const turnId = v['turnId']
+  if (typeof turnId !== 'number' || !Number.isSafeInteger(turnId) || turnId <= 0) return null
+  return { speaker: v['speaker'], turnId }
+}
+
+function toLiveTranslationEvent(value: unknown): GeminiLiveTranslationEvent | null {
+  if (typeof value !== 'object' || value === null) return null
+  const v = value as Record<string, unknown>
+  const turnId = v['turnId']
+  if (typeof turnId !== 'number' || !Number.isSafeInteger(turnId) || turnId <= 0) return null
+  if (typeof v['translatedText'] !== 'string' || v['translatedText'].length === 0) return null
+  return { turnId, translatedText: v['translatedText'] }
 }
 
 function toLiveAudioChunkEvent(value: unknown): GeminiLiveAudioChunkEvent | null {
@@ -725,8 +775,11 @@ const api: MockPilotApi = {
   stopLiveSession: (): Promise<OperationResult> =>
     ipcRenderer.invoke(IPC_CHANNELS.GEMINI_LIVE_STOP).then(toOperationResult),
 
-  sendMicChunk: (chunk: ArrayBuffer): Promise<OperationResult> =>
-    ipcRenderer.invoke(IPC_CHANNELS.GEMINI_LIVE_SEND_AUDIO, chunk).then(toOperationResult),
+  sendAudioChunk: (chunk: ArrayBuffer, capturedAtMs: number): Promise<OperationResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.GEMINI_LIVE_SEND_AUDIO, { chunk, capturedAtMs }).then(toOperationResult),
+
+  sendMicChunk: (chunk: ArrayBuffer, capturedAtMs: number): Promise<OperationResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.GEMINI_LIVE_SEND_AUDIO, { chunk, capturedAtMs }).then(toOperationResult),
 
   onLiveTranscript: (callback: (event: GeminiLiveTranscriptEvent) => void): (() => void) =>
     subscribe(IPC_CHANNELS.GEMINI_LIVE_TRANSCRIPT, toLiveTranscriptEvent, callback),
@@ -743,6 +796,12 @@ const api: MockPilotApi = {
   onLiveAnswerReview: (callback: (event: GeminiLiveAnswerReviewEvent) => void): (() => void) =>
     subscribe(IPC_CHANNELS.GEMINI_LIVE_ANSWER_REVIEW, toLiveAnswerReviewEvent, callback),
 
+  onLiveTurnFinished: (callback: (event: GeminiLiveTurnFinishedEvent) => void): (() => void) =>
+    subscribe(IPC_CHANNELS.GEMINI_LIVE_TURN_FINISHED, toLiveTurnFinishedEvent, callback),
+
+  onLiveTranslation: (callback: (event: GeminiLiveTranslationEvent) => void): (() => void) =>
+    subscribe(IPC_CHANNELS.GEMINI_LIVE_TRANSLATION, toLiveTranslationEvent, callback),
+
   indexInterviewMaterials: (resumePdfBytes: ArrayBuffer | null, jdText: string | null): Promise<RagIndexResult> =>
     ipcRenderer.invoke(IPC_CHANNELS.RAG_INDEX_MATERIALS, { resumePdfBytes, jdText }).then(toRagIndexResult),
 
@@ -750,6 +809,18 @@ const api: MockPilotApi = {
 
   clearInterviewMaterials: (): Promise<OperationResult> =>
     ipcRenderer.invoke(IPC_CHANNELS.RAG_CLEAR_MATERIALS).then(toOperationResult),
+
+  indexQaBank: (entries: QaBankEntry[]): Promise<QaBankIndexResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.QA_BANK_INDEX, entries).then(toQaBankIndexResult),
+
+  getQaBankStatus: (): Promise<QaBankStatusResult> => ipcRenderer.invoke(IPC_CHANNELS.QA_BANK_STATUS).then(toQaBankStatusResult),
+
+  clearQaBank: (): Promise<OperationResult> => ipcRenderer.invoke(IPC_CHANNELS.QA_BANK_CLEAR).then(toOperationResult),
+
+  getLearnedAnswerStatus: (): Promise<LearnedAnswerStatusResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.LEARNED_ANSWERS_STATUS).then(toLearnedAnswerStatusResult),
+
+  clearLearnedAnswers: (): Promise<OperationResult> => ipcRenderer.invoke(IPC_CHANNELS.LEARNED_ANSWERS_CLEAR).then(toOperationResult),
 
   captureScreenshotNow: (): Promise<OperationResult> =>
     ipcRenderer.invoke(IPC_CHANNELS.CODING_SCREENSHOT_CAPTURE_NOW).then(toOperationResult),

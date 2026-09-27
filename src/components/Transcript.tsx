@@ -8,6 +8,8 @@ export interface TranscriptTurn {
   text: string
   /** Whether Gemini has finished transcribing this turn (a still-growing turn shows a "…" cue). */
   finished: boolean
+  /** Set once an 'interviewer' turn's history row exists (see onLiveInterviewerTurn) -- lets a later onLiveTranslation event find and replace this turn's text. */
+  turnId?: number
 }
 
 interface TranscriptProps {
@@ -38,10 +40,18 @@ function Transcript({ turns }: TranscriptProps): JSX.Element {
           <span
             className={cn(
               'text-xs font-medium uppercase tracking-wide',
-              turn.speaker === 'user' ? 'text-primary' : 'text-muted-foreground'
+              turn.speaker === 'assistant'
+                ? 'text-purple-400 font-semibold'
+                : turn.speaker === 'interviewer'
+                ? 'text-cyan-400 font-semibold'
+                : 'text-primary'
             )}
           >
-            {turn.speaker === 'user' ? 'You' : 'Interviewer'}
+            {turn.speaker === 'assistant'
+              ? '⚡ GhostKit AI (Response)'
+              : turn.speaker === 'interviewer'
+              ? '🎧 Interviewer (System Audio)'
+              : 'You'}
           </span>
           <p className="text-sm leading-snug">
             {turn.text || (!turn.finished ? '…' : '')}

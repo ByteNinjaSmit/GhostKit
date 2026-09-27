@@ -17,7 +17,9 @@ import type {
   GeminiLiveAudioChunkEvent,
   GeminiLiveConnectionState,
   GeminiLiveConnectionStateEvent,
+  GeminiLiveTurnFinishedEvent,
   GeminiLiveTranscriptEvent,
+  GeminiLiveTranslationEvent,
   InterviewSetup
 } from '../../electron/ipc-types'
 
@@ -84,38 +86,64 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
 
   const handleTranscript = (event: GeminiLiveTranscriptEvent): void => {
     if (!mountedRef.current) return
+    let delta = event.textDelta
+    if (event.speaker === 'assistant') {
+      delta = delta
+        .replace(/\*\*(?:Awaiting Prompt Clarity|Awaiting User Input|Acknowledge Audio Clarity|Maintaining Silence)[^*]*\*\*/gi, '')
+        .replace(/I'm designed to be a silent observer until prompted\.[^.\n]*\.?/gi, '')
+        .replace(/I'm currently maintaining silence[^.\n]*\.?/gi, '')
+    }
     setTranscriptTurns((turns) => {
       const last = turns[turns.length - 1]
       if (last && last.speaker === event.speaker && !last.finished) {
         const updated = turns.slice(0, -1)
-        updated.push({ ...last, text: last.text + event.textDelta, finished: event.finished })
+        updated.push({ ...last, text: last.text + delta, finished: event.finished })
         return updated
       }
       const turn: TranscriptTurn = {
         id: nextTurnIdRef.current++,
         speaker: event.speaker,
-        text: event.textDelta,
+        text: delta,
         finished: event.finished
       }
       return [...turns, turn]
     })
   }
 
-  const handleAudioChunk = (event: GeminiLiveAudioChunkEvent): void => {
-    playerRef.current?.enqueue(event.audio)
+  const handleAudioChunk = (_event: GeminiLiveAudioChunkEvent): void => {
+    // Silent on speakers: the AI responses are rendered as text on screen
   }
 
   const handleInterrupted = (): void => {
     playerRef.current?.clear()
   }
 
+  const handleTurnFinished = (event: GeminiLiveTurnFinishedEvent): void => {
+    if (!mountedRef.current) return
+    // Authoritative override -- see GeminiLiveTurnFinishedEvent's doc comment.
+    setTranscriptTurns((turns) => {
+      const lastIdx = turns.map((t) => t.speaker).lastIndexOf(event.speaker)
+      if (lastIdx === -1) return turns
+      const updated = [...turns]
+      updated[lastIdx] = { ...updated[lastIdx], turnId: event.turnId, finished: true }
+      return updated
+    })
+  }
+
+  const handleTranslation = (event: GeminiLiveTranslationEvent): void => {
+    if (!mountedRef.current) return
+    setTranscriptTurns((turns) => {
+      const idx = turns.findIndex((t) => t.turnId === event.turnId)
+      if (idx === -1) return turns
+      const updated = [...turns]
+      updated[idx] = { ...updated[idx], text: event.translatedText }
+      return updated
+    })
+  }
+
   const handleAnswerReview = (event: GeminiLiveAnswerReviewEvent): void => {
     if (!mountedRef.current) return
     setReviews((prev) => {
-      // Defensive de-dup by answerIndex (shouldn't happen -- geminiLive.ts
-      // fires review.ts's call exactly once per finished answer turn -- but
-      // cheap to guard against a duplicate push rather than rendering two
-      // cards for the same answer).
       const withoutDuplicate = prev.filter((r) => r.answerIndex !== event.answerIndex)
       return [...withoutDuplicate, event].sort((a, b) => a.answerIndex - b.answerIndex)
     })
@@ -125,6 +153,18 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
     if (!mountedRef.current) return
     liveOpenRef.current = event.state === 'open'
     setLiveState(event.state)
+    if (event.state === 'closed') {
+      if (pipelineRef.current !== null || streamsRef.current !== null) {
+        pipelineRef.current?.dispose()
+        pipelineRef.current = null
+        stopCapture()
+        streamsRef.current = null
+        playerRef.current?.dispose()
+        playerRef.current = null
+        setCaptureState('idle')
+        setWorkletActive(null)
+      }
+    }
     if (event.state === 'error') {
       setError(event.message ?? 'The interview session hit an error and could not continue.')
     }
@@ -140,6 +180,8 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
     const unsubscribeAudio = window.api.onLiveAudioChunk(handleAudioChunk)
     const unsubscribeState = window.api.onLiveConnectionState(handleConnectionState)
     const unsubscribeInterrupted = window.api.onLiveInterrupted(handleInterrupted)
+    const unsubscribeTurnFinished = window.api.onLiveTurnFinished(handleTurnFinished)
+    const unsubscribeTranslation = window.api.onLiveTranslation(handleTranslation)
     const unsubscribeAnswerReview = window.api.onLiveAnswerReview(handleAnswerReview)
     const unsubscribePanic = window.api.onPanic(() => {
       teardown()
@@ -162,6 +204,8 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
       unsubscribeAudio()
       unsubscribeState()
       unsubscribeInterrupted()
+      unsubscribeTurnFinished()
+      unsubscribeTranslation()
       unsubscribeAnswerReview()
       unsubscribePanic()
     }
@@ -233,13 +277,9 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
       try {
         playerRef.current = createAudioPlayer()
         const pipeline = await createAudioPipeline(captureResult.streams, {
-          onMicChunk: (chunk) => {
-            // Best-effort: if the live session isn't open yet (still
-            // connecting) or drops mid-chunk, sendMicChunk resolves with
-            // { ok: false } rather than throwing -- nothing to react to
-            // per-chunk, the connection-state banner already covers it.
+          onSystemChunk: (chunk, capturedAtMs) => {
             if (liveOpenRef.current) {
-              void window.api.sendMicChunk(chunk)
+              void window.api.sendMicChunk(chunk, capturedAtMs)
             }
           }
         })
@@ -353,11 +393,17 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
             >
               {isStarting ? 'Starting…' : 'Start interview'}
             </Button>
-            <Button type="button" variant="outline" onClick={handleStop} disabled={captureState === 'idle'} title={`Stop (${SHORTCUT_TOGGLE_SESSION_LABEL})`}>
+            <Button type="button" variant="outline" onClick={handleStop} disabled={captureState === 'idle' && liveState !== 'open'} title={`Stop (${SHORTCUT_TOGGLE_SESSION_LABEL})`}>
               Stop interview
             </Button>
-            {isRunning && <LiveStateBadge state={liveState} />}
+            {(isRunning || liveState === 'open') && <LiveStateBadge state={liveState} />}
           </div>
+
+          {liveState === 'open' && captureState === 'idle' && (
+            <StatusBanner tone="info">
+              Live session is active via the Floating Overlay Widget. AI text responses are streaming in real-time.
+            </StatusBanner>
+          )}
 
           <p className="text-xs text-muted-foreground">Shortcut: {SHORTCUT_TOGGLE_SESSION_LABEL} starts/stops the interview while this window is focused.</p>
 

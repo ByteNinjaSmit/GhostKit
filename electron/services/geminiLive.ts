@@ -49,6 +49,7 @@ import { describeGeminiError } from './gemini'
 import { LiveConnectError, closeCodeOf } from '../lib/liveConnectError'
 import * as rag from './rag'
 import * as review from './review'
+import * as translate from './translate'
 import * as history from './history'
 import * as usage from './usage'
 import { redact } from '../lib/redact'
@@ -59,8 +60,10 @@ import type {
   GeminiLiveAnswerReviewEvent,
   GeminiLiveAudioChunkEvent,
   GeminiLiveConnectionStateEvent,
+  GeminiLiveTurnFinishedEvent,
   GeminiLiveSpeaker,
   GeminiLiveTranscriptEvent,
+  GeminiLiveTranslationEvent,
   InterviewDifficulty,
   InterviewSetup,
   OperationResult
@@ -136,6 +139,10 @@ export interface GeminiLiveEventSink {
   onInterrupted: () => void
   /** Phase 4: a completed candidate answer's structured Gemini review + local speech metrics. Fired asynchronously, independent of transcript/audio events -- see `runAnswerReview`'s doc comment for why this must never be awaited from inside the message-handling path. */
   onAnswerReview: (event: GeminiLiveAnswerReviewEvent) => void
+  /** A turn's history row id, sent synchronously right after that turn's text is final, for ANY speaker -- see `GeminiLiveTurnFinishedEvent`'s doc comment for why this exists (Gemini's own per-fragment `finished` flag is unreliable) and how the renderer should use it. */
+  onTurnFinished: (event: GeminiLiveTurnFinishedEvent) => void
+  /** The interviewer's question, translated to English. Fired asynchronously (a separate translate.ts call), independent of transcript events -- same fire-and-forget posture as `onAnswerReview`. */
+  onInterviewerTranslation: (event: GeminiLiveTranslationEvent) => void
 }
 
 let session: Session | null = null
@@ -184,6 +191,54 @@ let lastInterviewerQuestion: string | null = null
 let interviewerTurnBuffer = ''
 /** ms epoch of the first non-blank fragment of the in-progress interviewer turn (history timestamps); `null` when nothing is buffered. */
 let interviewerTurnStartedAt: number | null = null
+/**
+ * Client-side silence cutoff for the interviewer's turn -- (re)armed on
+ * every interviewer fragment, fires `flushInterviewerTurn` if no further
+ * fragment arrives within INTERVIEWER_SILENCE_FLUSH_MS. This is now the
+ * PRIMARY way a question gets recognized as finished.
+ *
+ * Why it exists: `content.turnComplete` (this module's other flush trigger)
+ * fires only once the Live model's OWN hidden response finishes generating --
+ * and since that response is full synthesized AUDIO regardless of what the
+ * candidate ever sees (every Live model available to this key requires an
+ * audio response; see runFastTextAnswer's doc comment), waiting on it
+ * reintroduces the exact ~20-30s delay switching the ANSWER to a separate
+ * fast text call was meant to eliminate -- just moved to before "question
+ * finalized" instead of after it (confirmed live, 2026-09-27: a 7-character
+ * question took 20.8s to finalize). The implicit "next speaker started"
+ * boundary that used to also catch this doesn't fire anymore either, now
+ * that the Live model's own response text is never fed through
+ * `emitTranscript` at all (see handleServerMessage's comment on why it's
+ * discarded). A short client-side silence timer decides "the interviewer
+ * stopped talking" from the transcription stream itself, independent of
+ * anything the model is doing in the background.
+ */
+let interviewerFlushTimer: ReturnType<typeof setTimeout> | null = null
+/**
+ * How long to wait, after the interviewer's last transcript fragment, before
+ * treating their turn as over.
+ *
+ * TRIED 900ms first (2026-09-27) -- too aggressive: confirmed live, it split
+ * single sentences with an ordinary mid-sentence pause into multiple
+ * separate "questions" (e.g. "Show me the SQL query that fetches the data
+ * from" / "all row." landed as two turns), each of which then fired its own
+ * answer -- combined with answerQueue's fix for concurrent answers
+ * corrupting each other, a too-short cutoff was BY ITSELF enough to produce
+ * answers that look like they're for the wrong question, because they often
+ * literally were, generated from a truncated half-sentence.
+ *
+ * Raised to 1500ms, ran several full sessions with zero split-question
+ * symptoms -- confirmed safe. LOWERED to 1100ms (2026-09-27, at the user's
+ * request to shave more real latency off every answer once the pipeline was
+ * otherwise proven instant -- see sendAudioChunk's capture->receipt
+ * logging): a deliberate, less-tested trade of some of that safety margin
+ * back for ~400ms off every question. If a question ever again gets visibly
+ * cut short mid-sentence (the tell-tale symptom from the 900ms failure --
+ * check the "question finalized (N chars)" log against what was actually
+ * asked), that is the signal to raise this back toward 1500ms, not to
+ * lower it further.
+ */
+const INTERVIEWER_SILENCE_FLUSH_MS = 1100
 /**
  * Row id (history.ts) of the session currently being recorded, or `null` when
  * none is (no live session, the history DB failed to open, or the session has
@@ -287,6 +342,9 @@ export async function startSession(
     lastInterviewerQuestion = null
     interviewerTurnBuffer = ''
     interviewerTurnStartedAt = null
+    clearInterviewerFlushTimer()
+    lastAudioChunkAt = null
+    audioChunkCount = 0
     userTurnBuffer = { text: '', fragments: [] }
     lastActiveSpeaker = null
     questionForPendingAnswer = null
@@ -368,6 +426,13 @@ export function stopSession(): OperationResult {
   finishHistorySession()
   generation++ // invalidates any in-flight openConnection()/reconnect callback
   clearReconnectTimer()
+  if (sink !== null) {
+    try {
+      sink.onConnectionState({ state: 'closed' })
+    } catch {
+      // Best effort
+    }
+  }
   const current = session
   session = null
   sink = null
@@ -378,6 +443,7 @@ export function stopSession(): OperationResult {
   lastInterviewerQuestion = null
   interviewerTurnBuffer = ''
   interviewerTurnStartedAt = null
+  clearInterviewerFlushTimer()
   userTurnBuffer = { text: '', fragments: [] }
   lastActiveSpeaker = null
   questionForPendingAnswer = null
@@ -388,22 +454,84 @@ export function stopSession(): OperationResult {
   return { ok: true }
 }
 
+/** ms epoch this module last received an audio chunk via `sendAudioChunk`; `null` between sessions. Used only for the stall/health logging below. */
+let lastAudioChunkAt: number | null = null
+/** Total chunks received in the current session -- used to space out the periodic health log below without flooding the console. */
+let audioChunkCount = 0
+
 /**
- * Forwards one mic PCM16 chunk to the live session as realtime audio input.
+ * pcm-worklet.js emits one chunk every ~100ms -- a materially larger gap
+ * between consecutive `sendAudioChunk` calls means audio is backing up
+ * somewhere upstream of this function (the renderer's capture/worklet, or
+ * the IPC hop itself), which is worth knowing about explicitly rather than
+ * only ever showing up indirectly as "the question took a while to
+ * recognize." 400ms is ~4x the expected cadence -- generous enough to not
+ * false-positive on ordinary event-loop jitter.
+ */
+const AUDIO_CHUNK_STALL_WARN_MS = 400
+
+/** How often (in chunk count, ~every 3s at the normal 100ms cadence) to log a routine "audio is flowing" confirmation -- a baseline signal that the pipeline is healthy, not just an absence of stall warnings. */
+const AUDIO_CHUNK_LOG_EVERY = 30
+
+/**
+ * A renderer-capture -> main-process-receipt gap larger than this gets
+ * logged unconditionally (not just in the periodic summary) -- this is
+ * THIS APP'S OWN pipeline latency (worklet -> IPC -> here), a different
+ * measurement from AUDIO_CHUNK_STALL_WARN_MS (gap between consecutive
+ * chunks) and from Gemini's own server-side ASR latency (measured
+ * separately via the barge-in/first-fragment timing logs). Both processes
+ * read the same OS clock, so this needs no cross-process clock sync. 60ms is
+ * generous for a same-machine IPC hop -- ordinary same-machine Electron IPC
+ * is sub-millisecond to a few ms; anything consistently higher than this
+ * points at real queuing in the renderer (main thread busy, worklet backing
+ * up) rather than IPC overhead itself.
+ */
+const CAPTURE_TO_RECEIPT_WARN_MS = 60
+
+/**
+ * Forwards one system-audio PCM16 chunk to the live session as realtime
+ * audio input. `capturedAtMs` is `Date.now()` in the renderer at the moment
+ * the worklet produced this exact chunk (see MockPilotApi.sendMicChunk's
+ * doc comment) -- used only for the latency logging below, never for
+ * anything functional.
  *
- * Mic only -- see the module doc comment for why system-audio loopback must
- * never be sent here. Callers (electron/main.ts's IPC handler) are
+ * Callers (electron/main.ts's IPC handler) are
  * responsible for confirming `chunk` really is an `ArrayBuffer` before
  * calling this; the byte-length bound below is this module's own defense
  * regardless of what the caller already checked.
  */
-export function sendAudioChunk(chunk: ArrayBuffer): OperationResult {
+export function sendAudioChunk(chunk: ArrayBuffer, capturedAtMs: number): OperationResult {
   if (session === null) {
     return { ok: false, error: 'No live session is running.' }
   }
   if (chunk.byteLength === 0 || chunk.byteLength > MAX_AUDIO_CHUNK_BYTES) {
     return { ok: false, error: 'Invalid audio chunk size.' }
   }
+
+  // Diagnostic only (2026-09-27, at the user's request) -- see
+  // AUDIO_CHUNK_STALL_WARN_MS's doc comment for why this exists: tells apart
+  // "the audio pipeline itself is backing up" from "the model/network is
+  // slow to answer", which otherwise both just look like "everything is
+  // slow" from the transcript.
+  const now = Date.now()
+  audioChunkCount++
+  if (lastAudioChunkAt !== null) {
+    const gap = now - lastAudioChunkAt
+    if (gap > AUDIO_CHUNK_STALL_WARN_MS) {
+      console.warn(`[gemini-live][timing] audio input STALL: ${gap}ms since the previous chunk (expected ~100ms) at`, new Date(now).toISOString())
+    }
+  }
+  const captureToReceiptMs = now - capturedAtMs
+  if (captureToReceiptMs > CAPTURE_TO_RECEIPT_WARN_MS) {
+    console.warn(`[gemini-live][timing] audio chunk #${audioChunkCount}: ${captureToReceiptMs}ms from renderer capture to main-process receipt (this app's own pipeline, not Gemini's) at`, new Date(now).toISOString())
+  }
+  if (audioChunkCount % AUDIO_CHUNK_LOG_EVERY === 0) {
+    console.log(
+      `[gemini-live][timing] audio input: ${audioChunkCount} chunks sent so far, most recent capture->receipt ${captureToReceiptMs}ms, at`,
+      new Date(now).toISOString()
+    )
+  }
+  lastAudioChunkAt = now
 
   try {
     const base64 = Buffer.from(chunk).toString('base64')
@@ -489,6 +617,16 @@ async function buildInterviewerSystemInstruction(
     console.error('[gemini-live] RAG retrieval threw unexpectedly, falling back to stub context:', redact(String(err)))
     return { resumeChunks: null, jdChunks: null }
   })
+  // Candidate-curated prepared-answer bank (see rag.ts's "Prepared Q&A bank"
+  // section) -- baked into the system prompt once here, same as resume/jd,
+  // rather than retrieved per-turn: the Live API has no hook to inject fresh
+  // context mid-conversation without reconnecting, so "fast retrieval" for
+  // this content means the model already has it in context for the whole
+  // session, not a per-question database round-trip.
+  const qaBank = await rag.retrieveQaBank(setup.role, token).catch((err: unknown) => {
+    console.error('[gemini-live] qa bank retrieval threw unexpectedly, falling back to none:', redact(String(err)))
+    return null
+  })
 
   const company = setup.company.trim()
 
@@ -507,6 +645,10 @@ async function buildInterviewerSystemInstruction(
       jdChunks !== null
         ? fenceChunkText('job description excerpts', jdChunks)
         : '(not yet available -- no job description was provided for this session.)',
+    qa_bank:
+      qaBank !== null
+        ? fenceChunkText('prepared Q&A pairs', qaBank)
+        : '(none provided for this session.)',
     focus_topics: renderFocusTopics(focusTopics)
   })
 
@@ -541,10 +683,43 @@ async function openConnection(apiKey: string, resumeHandle: string | null, myGen
   const connectPromise = ai.live.connect({
     model: LIVE_MODEL_ID,
     config: {
+      // TRIED Modality.TEXT here (2026-09-27) to skip speech synthesis
+      // latency -- the theory: with AUDIO responses, `outputTranscription`
+      // streams in lockstep with synthesized SPEECH (a ~90-word answer takes
+      // ~30s to "speak" even though this app never plays the audio back --
+      // see handleAudioChunk in Interview.tsx, it's received and discarded),
+      // which is plausibly most of this app's answer latency. CONFIRMED
+      // WRONG against the real API: LIVE_MODEL_ID is a native-audio-dialog
+      // model, and it rejects a TEXT-only responseModalities outright --
+      // socket closes with code 1007 before setupComplete ever arrives, i.e.
+      // before the connect promise can even resolve. Reverted to AUDIO. If
+      // this is revisited, it needs a genuinely text-capable Live model (the
+      // "half-cascade" line, not native-audio-dialog -- see LIVE_MODEL_ID's
+      // own doc comment for that distinction and known-working alternate ids
+      // from `ai.models.list()`), not just a config flip on this one.
       responseModalities: [Modality.AUDIO],
-      inputAudioTranscription: {},
+      // Confirmed live, 2026-09-27: with no hint, automatic language
+      // detection misheard an Indian-accented English question ("explain to
+      // me about large language model") as Hindi and transcribed it
+      // phonetically in Devanagari script -- the fast-answer call then had
+      // to work from that garbled text and produced a nonsense reply.
+      // `languageCodes` narrows the ASR's candidate languages rather than
+      // picking one exclusively; en-IN specifically covers Indian-accented
+      // English (the actual failure case here), en-US as the general
+      // fallback, hi-IN kept since rule 1 (prompts/interviewer.md) commits to
+      // supporting genuine Hindi questions, not just English ones.
+      inputAudioTranscription: { languageCodes: ['en-IN', 'en-US', 'hi-IN'] },
       outputAudioTranscription: {},
       systemInstruction,
+      // The candidate-facing overlay must show only the final answer -- never
+      // the model's own reasoning. Some native-audio Live models emit
+      // `thought: true` parts alongside the real answer regardless of the
+      // system prompt telling them not to (prompt-level instructions can't
+      // suppress a separate SDK-level content channel); asking the API to
+      // not return thoughts at all is the actual fix, with handleServerMessage's
+      // `part.thought` check below as defense-in-depth if a thought part slips
+      // through anyway.
+      thinkingConfig: { includeThoughts: false },
       // Live audio-only sessions are time-capped by Google even with
       // compression enabled (the server sends a `goAway` shortly before
       // cutting the connection, handled in handleServerMessage below).
@@ -552,7 +727,23 @@ async function openConnection(apiKey: string, resumeHandle: string | null, myGen
       // just needs to not crash or wedge when the cap hits, which the
       // ordinary reconnect-on-close path below already covers.
       contextWindowCompression: { slidingWindow: {} },
-      sessionResumption: resumeHandle !== null ? { handle: resumeHandle } : {}
+      sessionResumption: resumeHandle !== null ? { handle: resumeHandle } : {},
+      // How long the model waits, after the interviewer stops talking, before
+      // it commits to "they're done" and starts generating a response -- the
+      // single biggest lever on perceived answer latency (bigger than model
+      // choice or prompt length: the model can't even START generating until
+      // this fires). The SDK/API default is tuned for natural conversation
+      // pacing, which reads as sluggish for this app's actual job -- getting
+      // the candidate an answer the instant a question ends, not politely
+      // waiting out a pause in case the interviewer keeps talking. Lower
+      // values trade a small risk of cutting off a genuine mid-question pause
+      // for materially faster turn-taking.
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          silenceDurationMs: 400,
+          prefixPaddingMs: 100
+        }
+      }
     },
     callbacks: {
       onopen: () => {
@@ -567,12 +758,23 @@ async function openConnection(apiKey: string, resumeHandle: string | null, myGen
         // 'onclose' always follows and drives reconnection/state -- this is
         // diagnostic-only, and redacted like any other error text that
         // might reach a log.
-        console.error('[gemini-live] websocket error:', redact(describeSocketEvent(event)))
+        console.error('[gemini-live][timing] websocket error at', new Date().toISOString(), ':', redact(describeSocketEvent(event)))
       },
       onclose: (event: unknown) => {
         if (abandoned) return
-        // Numeric close code only (never the server's reason text) -- diagnostic for "why did it drop".
-        console.warn('[gemini-live] socket closed (code:', closeCodeOf(event) ?? 'unknown', connected ? ', after setup)' : ', before setup)')
+        // Numeric close code only (never the server's reason text) -- diagnostic
+        // for "why did it drop". Timestamped so it can be correlated against
+        // the fast-text-answer timing logs -- e.g. a close landing right
+        // between "question finalized" and "answer done" pinpoints a network
+        // drop as the actual cause of a missing/late answer, rather than
+        // leaving that indistinguishable from the answer call just being slow.
+        console.warn(
+          '[gemini-live][timing] socket closed at',
+          new Date().toISOString(),
+          '(code:',
+          closeCodeOf(event) ?? 'unknown',
+          connected ? ', after setup)' : ', before setup)'
+        )
         if (!connected) {
           abandoned = true
           rejectEarlyClose(new LiveConnectError('closed', closeCodeOf(event)))
@@ -633,12 +835,28 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
 
   const content = message.serverContent
   if (content?.inputTranscription) {
-    emitTranscript(myGeneration, 'user', content.inputTranscription)
+    // Every fragment, not just the first of a turn -- at the user's request,
+    // to tell apart "Gemini stopped transcribing while the interviewer kept
+    // talking" (a real bug) from "the interviewer was genuinely silent for a
+    // while" (normal -- reading the previous answer, thinking), which look
+    // identical from the outside without this.
+    const preview = (content.inputTranscription.text ?? '').slice(0, 40)
+    console.log(
+      `[gemini-live][timing] interviewer fragment: "${preview}${(content.inputTranscription.text ?? '').length > 40 ? '…' : ''}" finished=${content.inputTranscription.finished === true} at`,
+      new Date().toISOString()
+    )
+    emitTranscript(myGeneration, 'interviewer', content.inputTranscription)
   }
-  if (content?.outputTranscription) {
-    emitTranscript(myGeneration, 'interviewer', content.outputTranscription)
-  }
+  // The Live model's OWN spoken response (content.outputTranscription /
+  // content.modelTurn.parts) is deliberately never shown to the candidate --
+  // see runFastTextAnswer's doc comment for why. Its audio still gets
+  // generated server-side regardless (every Live model available to this
+  // key requires an audio response; confirmed against the real API,
+  // 2026-09-27 -- see openConnection's responseModalities comment) and still
+  // arrives via `message.data` below, harmlessly discarded downstream (the
+  // renderer never plays it back).
   if (content?.interrupted === true) {
+    console.log('[gemini-live][timing] barge-in: interviewer spoke over the hidden model response at', new Date().toISOString())
     // The candidate started talking over the interviewer; Gemini stopped
     // generating, and the interviewer's in-progress turn never gets its own
     // finished/turnComplete signal. Drop the partial buffer rather than let
@@ -650,12 +868,14 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
     persistPartialInterviewerTurn()
     interviewerTurnBuffer = ''
     interviewerTurnStartedAt = null
+    clearInterviewerFlushTimer()
     // The player is likely still scheduled seconds ahead of real time (it
     // plays faster than realtime audio generates) -- tell it to drop the
     // abandoned turn rather than let stale audio keep playing.
     sink.onInterrupted()
   }
   if (content?.turnComplete === true) {
+    console.log('[gemini-live][timing] turnComplete: the hidden model response finished generating at', new Date().toISOString())
     // Authoritative signal that the interviewer is done generating this
     // turn -- flush any residual interviewer buffer even if its own
     // transcription fragment never carried `finished: true` (that field is
@@ -677,9 +897,30 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
   }
 }
 
+/**
+ * This runs on every streamed fragment, not the assembled turn -- a
+ * `.trimStart()` here used to eat the leading space off nearly every
+ * word-boundary chunk (Live streams assistant text in small pieces, many of
+ * which start with a space, e.g. "Hello", " Yes", ","), which is why the
+ * transcript used to glue words together ("Yes,I canhearyou"). Leading
+ * whitespace on the very first fragment of a turn is cosmetically harmless
+ * left in place -- flushUserTurn already `.trim()`s the assembled answer
+ * before it's persisted to history.
+ */
+function cleanCopilotText(text: string): string {
+  return text
+    .replace(/\*\*(?:Awaiting Prompt Clarity|Awaiting User Input|Acknowledge Audio Clarity|Maintaining Silence)[^*]*\*\*/gi, '')
+    .replace(/I'm designed to be a silent observer until prompted\.[^.\n]*\.?/gi, '')
+    .replace(/I'm currently maintaining silence[^.\n]*\.?/gi, '')
+    .replace(/My current focus is on the user's audio clarity\.[^.\n]*\.?/gi, '')
+}
+
 function emitTranscript(myGeneration: number, speaker: GeminiLiveSpeaker, transcription: Transcription): void {
   if (myGeneration !== generation || sink === null) return
-  const text = transcription.text ?? ''
+  let text = transcription.text ?? ''
+  if (speaker === 'assistant') {
+    text = cleanCopilotText(text)
+  }
   const finished = transcription.finished === true
   if (text.length === 0 && !finished) return
   sink.onTranscript({ speaker, textDelta: text, finished })
@@ -699,17 +940,30 @@ function emitTranscript(myGeneration: number, speaker: GeminiLiveSpeaker, transc
   lastActiveSpeaker = speaker
 
   if (speaker === 'interviewer') {
-    if (interviewerTurnBuffer.length === 0 && text.trim().length > 0) interviewerTurnStartedAt = Date.now()
+    if (interviewerTurnBuffer.length === 0 && text.trim().length > 0) {
+      interviewerTurnStartedAt = Date.now()
+      console.log('[gemini-live][timing] interviewer turn: first fragment received at', new Date(interviewerTurnStartedAt).toISOString())
+    }
     interviewerTurnBuffer += text
-    if (finished) flushInterviewerTurn(myGeneration)
+    // Deliberately IGNORING Gemini's own per-fragment `finished` flag here --
+    // confirmed live, 2026-09-27: it fired `true` after just 7 characters of
+    // a real ~32-character question ("What is your greatest strength?"),
+    // which flushed and sent a 7-char fragment ("What is") off for an
+    // answer, producing nothing usable (0 chunks back). This field was
+    // already documented as "optional"/unreliable on the SDK's type; turns
+    // out it isn't just sometimes MISSING, it can also fire flat-out WRONG
+    // (early). The silence timer is a materially more trustworthy signal for
+    // "the interviewer actually stopped talking" than a single fragment's own
+    // claim about itself -- so every fragment, finished-flagged or not, just
+    // re-arms it. `content.turnComplete` (elsewhere in this file) remains as
+    // a last-resort backstop for the rare case this timer never fires at all.
+    armInterviewerFlushTimer(myGeneration)
     return
   }
 
-  // speaker === 'user'
+  // speaker === 'assistant' or 'user'
   if (userTurnBuffer.fragments.length === 0) {
-    // First fragment of a fresh candidate turn -- snapshot which question
-    // this answer is responding to now, not when it finishes (see
-    // questionForPendingAnswer's doc comment).
+    // First fragment of a fresh turn
     questionForPendingAnswer = lastInterviewerQuestion
   }
   userTurnBuffer.text += text
@@ -717,20 +971,256 @@ function emitTranscript(myGeneration: number, speaker: GeminiLiveSpeaker, transc
   if (finished) flushUserTurn(myGeneration)
 }
 
+/** (Re)arms the client-side silence cutoff -- see `interviewerFlushTimer`'s doc comment. Called on every non-finished interviewer fragment. */
+function armInterviewerFlushTimer(myGeneration: number): void {
+  clearInterviewerFlushTimer()
+  interviewerFlushTimer = setTimeout(() => {
+    interviewerFlushTimer = null
+    flushInterviewerTurn(myGeneration)
+  }, INTERVIEWER_SILENCE_FLUSH_MS)
+}
+
+function clearInterviewerFlushTimer(): void {
+  if (interviewerFlushTimer !== null) {
+    clearTimeout(interviewerFlushTimer)
+    interviewerFlushTimer = null
+  }
+}
+
 /** Finalizes the in-progress interviewer turn (if any non-empty text has accumulated) into `lastInterviewerQuestion`. Safe to call when nothing is buffered. Idempotent -- calling it twice in a row (e.g. both an explicit `finished` and a later speaker-change/`turnComplete`) is a no-op the second time, since the buffer is already empty. */
 function flushInterviewerTurn(myGeneration: number): void {
   if (myGeneration !== generation) return
+  clearInterviewerFlushTimer()
   const question = interviewerTurnBuffer.trim()
   const startedAt = interviewerTurnStartedAt ?? Date.now()
   interviewerTurnBuffer = ''
   interviewerTurnStartedAt = null
   if (question.length > 0) {
     lastInterviewerQuestion = question
-    recordTurn(historySessionId, 'interviewer', question, startedAt)
+    console.log(
+      `[gemini-live][timing] question finalized (${question.length} chars, took ${Date.now() - startedAt}ms from first fragment to finalize) at`,
+      new Date().toISOString()
+    )
+    const turnId = recordTurn(historySessionId, 'interviewer', question, startedAt)
+    if (turnId !== null && sink !== null) {
+      sink.onTurnFinished({ speaker: 'interviewer', turnId })
+      runInterviewerTranslation(myGeneration, turnId, question, usageToken)
+    }
+    runFastTextAnswer(myGeneration, question, usageToken)
   }
 }
 
-/** Finalizes the in-progress candidate turn (if any non-empty text has accumulated) and, if it clears MIN_ANSWER_WORDS_FOR_REVIEW, fires a review for it. Safe to call when nothing is buffered. */
+/**
+ * Model for the candidate-facing ANSWER, generated as plain text -- separate
+ * from LIVE_MODEL_ID entirely. Every Live (bidiGenerateContent) model
+ * available to this key requires an audio response (confirmed against the
+ * real API, 2026-09-27: `gemini-3.1-flash-live-preview` rejects
+ * `responseModalities: [TEXT]` immediately, `gemini-3.8-live` accepts the
+ * handshake but then closes with the same "not supported" error once
+ * generation actually starts -- there is no working text-only Live model to
+ * switch to), and `outputTranscription` streams in lockstep with that
+ * synthesized SPEECH -- a ~90-word answer takes ~30s to "speak" even though
+ * this app never plays it back (see handleServerMessage's comment on why
+ * Live's own response is now discarded). A plain, non-Live `generateContent`
+ * call has no audio step at all: the model just generates tokens, which is
+ * why this is dramatically faster for the exact same length of answer. Same
+ * known-working model as gemini.ts/review.ts/codingAssist.ts.
+ */
+const ANSWER_MODEL_ID = 'gemini-2.5-flash'
+
+/**
+ * REVERTED (2026-09-27): this used to cache one `GoogleGenAI` client across
+ * every question in a session, on the theory that reusing the SDK's
+ * underlying HTTP keep-alive connection would avoid paying a fresh TLS
+ * handshake per question. Confirmed live against the real API that this made
+ * things WORSE, not better: with the cached client, "time to first token"
+ * climbed steadily across a single session -- 2.3s, 1.9s, 3.3s, 4.9s, 4.0s
+ * -- despite the prompt/model/everything else staying identical between
+ * calls. That climb cannot be explained by anything in this app's own
+ * per-chunk code (the measurement stops the clock before this app has
+ * touched a single byte of the response), which points at connection-pool
+ * degradation from reusing one keep-alive socket across many sequential
+ * streaming requests. A fresh client per call is simpler and was never
+ * actually confirmed to be slower in the first place (the original ~3.5s
+ * baseline this "optimization" was chasing was about the same either way) --
+ * back to that here.
+ */
+
+/** Generous timeout for a full streaming answer -- this is now the actual candidate-facing latency budget, so it's bounded but not aggressively tight. */
+const ANSWER_TIMEOUT_MS = 20_000
+
+/**
+ * Chains every `runFastTextAnswer` call onto the previous one -- STRICTLY
+ * one answer streams at a time. Without this, two questions finalized close
+ * together (a legitimate quick follow-up, or -- before
+ * INTERVIEWER_SILENCE_FLUSH_MS was loosened -- a single sentence wrongly
+ * split into two) each fired their own concurrent stream into the SAME
+ * shared `userTurnBuffer` (emitTranscript has no notion of "which answer
+ * call" a chunk belongs to, only "the current unfinished assistant turn") --
+ * confirmed live, 2026-09-27: an unrelated question's answer text bled into
+ * a different question's bubble (a "bidding" question rendered a "vector"
+ * answer that belonged to an earlier, different question). Chaining onto
+ * this promise guarantees the second call's stream doesn't even START until
+ * the first one has fully finished emitting, so there is never more than one
+ * writer touching the buffer. `.catch(() => {})` keeps a failed run from
+ * poisoning the chain for whatever's queued after it -- the run itself
+ * already never throws (its own try/catch below), this is belt-and-braces.
+ */
+let answerQueue: Promise<void> = Promise.resolve()
+
+/**
+ * Fires the moment an interviewer question is finalized (flushInterviewerTurn).
+ * Queued (see `answerQueue`) rather than truly fire-and-forget, but still
+ * doesn't block its caller -- flushInterviewerTurn/the live interview keeps
+ * moving while this streams in, whether it's running now or waiting in line.
+ * Reuses `currentSystemInstruction` (the exact prompt built once at session
+ * start, resume/JD/qa-bank/focus-topics and all) rather than rebuilding
+ * anything, and streams through the SAME `emitTranscript` buffer/history/
+ * turnId machinery a Live-sourced assistant turn used to go through, so
+ * nothing downstream (GhostOverlay, Interview.tsx, history) needs to know
+ * the answer no longer comes from the Live session itself. Never throws.
+ */
+function runFastTextAnswer(myGeneration: number, question: string, usageTokenForTurn: number | null): void {
+  const systemInstruction = currentSystemInstruction
+  if (systemInstruction === null) return
+
+  answerQueue = answerQueue
+    .then(() => runFastTextAnswerNow(myGeneration, question, systemInstruction, usageTokenForTurn))
+    .catch(() => {})
+}
+
+async function runFastTextAnswerNow(myGeneration: number, question: string, systemInstruction: string, usageTokenForTurn: number | null): Promise<void> {
+  // A superseded generation (session stopped/restarted while this was
+  // queued behind an earlier answer) should never start a new stream.
+  if (myGeneration !== generation) return
+
+  // Cache check FIRST, inside the same queued slot as the generation it
+  // would otherwise trigger -- both paths end up calling emitTranscript for
+  // 'assistant', so this has to go through the SAME serialization as a live
+  // generation (see answerQueue's doc comment) rather than racing ahead of
+  // it. A hit is answered from a local vector lookup (tens of ms) instead of
+  // a live Gemini call (multiple seconds) -- see rag.ts's "Learned answer
+  // cache" section for the threshold/safety reasoning.
+  const cacheT0 = Date.now()
+  const cached = await rag.findLearnedAnswer(question, usageTokenForTurn)
+  if (myGeneration !== generation) return
+  if (cached !== null) {
+    console.log(`[gemini-live][timing] answer served from learned cache in ${Date.now() - cacheT0}ms (matched: "${cached.question.slice(0, 60)}")`)
+    emitTranscript(myGeneration, 'assistant', { text: cached.answer, finished: true })
+    return
+  }
+
+  let sawAny = false
+  let chunkCount = 0
+  let charCount = 0
+  let fullAnswer = ''
+    // Timing diagnostics (2026-09-27, at the user's request, to tell apart
+    // "the model/network is slow" from "something in this app is stuck") --
+    // every stage of this call is timestamped: request start, key lookup
+    // done, connection to Google established (stream object returned), first
+    // token actually received, and final completion, each logged with the
+    // elapsed ms since the PREVIOUS stage so a real network stall shows up
+    // as a large gap in a specific spot rather than one opaque total.
+    const t0 = Date.now()
+    console.log('[gemini-live][timing] fast text answer: starting request')
+    try {
+      const apiKey = await getApiKey()
+      if (apiKey === null || apiKey.length === 0 || myGeneration !== generation) return
+      const t1 = Date.now()
+      console.log(`[gemini-live][timing] fast text answer: got key (+${t1 - t0}ms)`)
+
+      const ai = new GoogleGenAI({ apiKey, httpOptions: { timeout: ANSWER_TIMEOUT_MS } })
+      const stream = await ai.models.generateContentStream({
+        model: ANSWER_MODEL_ID,
+        contents: question,
+        config: { systemInstruction }
+      })
+      const t2 = Date.now()
+      console.log(`[gemini-live][timing] fast text answer: stream call returned, awaiting first chunk (+${t2 - t1}ms since key, +${t2 - t0}ms total)`)
+
+      let firstChunkAt: number | null = null
+      for await (const chunk of stream) {
+        if (myGeneration !== generation) return
+        if (firstChunkAt === null) {
+          firstChunkAt = Date.now()
+          console.log(`[gemini-live][timing] fast text answer: FIRST CHUNK received (+${firstChunkAt - t2}ms since stream call, +${firstChunkAt - t0}ms total)`)
+        }
+        chunkCount++
+        if (chunk.usageMetadata !== undefined) {
+          usage.recordSession(usageTokenForTurn, 'live', ANSWER_MODEL_ID, chunk.usageMetadata)
+        }
+        // GenerateContentResponse.text already excludes `thought: true` parts
+        // (confirmed in the installed SDK) -- no separate thought-filtering
+        // needed here the way handleServerMessage needed for Live parts.
+        const text = chunk.text
+        if (typeof text === 'string' && text.length > 0) {
+          sawAny = true
+          charCount += text.length
+          fullAnswer += text
+          emitTranscript(myGeneration, 'assistant', { text, finished: false })
+        }
+      }
+      if (myGeneration === generation) {
+        if (sawAny) {
+          emitTranscript(myGeneration, 'assistant', { text: '', finished: true })
+          // Fire-and-forget -- see rag.ts's cacheLearnedAnswer doc comment.
+          // Never awaited: caching must not add to this answer's own
+          // latency, and a failure here must never affect the live interview.
+          void rag.cacheLearnedAnswer(question, fullAnswer)
+        } else {
+          // A successful call that streamed zero usable text (safety filter,
+          // an empty/malformed response, ...) must still surface SOMETHING --
+          // previously this left the question sitting with no reply at all,
+          // indistinguishable from the app having silently hung. Never leave
+          // a question visibly unanswered with no explanation.
+          emitTranscript(myGeneration, 'assistant', { text: "(Couldn't generate an answer for that -- try repeating the question.)", finished: true })
+        }
+      }
+      const tEnd = Date.now()
+      console.log(
+        `[gemini-live][timing] fast text answer: DONE -- ${chunkCount} chunks, ${charCount} chars, total ${tEnd - t0}ms` +
+          (firstChunkAt !== null ? ` (${firstChunkAt - t0}ms to first chunk, ${tEnd - firstChunkAt}ms streaming the rest)` : ' (no chunks received at all)')
+      )
+    } catch (err) {
+      const tErr = Date.now()
+      console.error(`[gemini-live][timing] fast text answer FAILED after ${tErr - t0}ms (${chunkCount} chunks received before the error):`, redact(String(err)))
+      if (myGeneration === generation) {
+        // Whatever streamed in before the failure is still worth keeping --
+        // flush it as a finished (if partial) answer rather than leaving the
+        // bubble stuck mid-generation forever. If nothing streamed at all,
+        // same "never leave it silently blank" reasoning as the zero-chunk
+        // success case above.
+        emitTranscript(myGeneration, 'assistant', {
+          text: sawAny ? '' : "(Couldn't generate an answer for that -- try repeating the question.)",
+          finished: true
+        })
+      }
+    }
+}
+
+/**
+ * Translates one interviewer turn's transcribed question to English and
+ * pushes the result through the event sink once it resolves. Deliberately
+ * NOT awaited by its caller (`flushInterviewerTurn`) -- same fire-and-forget
+ * rationale as `runAnswerReview`'s doc comment: the live interview keeps
+ * moving while this settles. `translateToEnglish` never throws and is
+ * bounded by TRANSLATE_TIMEOUT_MS, so this is safe to fire-and-forget.
+ */
+function runInterviewerTranslation(myGeneration: number, turnId: number, question: string, usageTokenForTurn: number | null): void {
+  void translate
+    .translateToEnglish(question, usageTokenForTurn)
+    .then((result) => {
+      if (myGeneration !== generation || sink === null || !result.ok || result.text === undefined) return
+      sink.onInterviewerTranslation({ turnId, translatedText: result.text })
+    })
+    .catch((err: unknown) => {
+      // translateToEnglish() itself never throws -- defensive backstop only,
+      // same posture as startSession's catch around buildInterviewerSystemInstruction.
+      console.error('[gemini-live] interviewer translation failed unexpectedly:', redact(String(err)))
+    })
+}
+
+/** Finalizes the in-progress assistant/candidate turn (if any non-empty text has accumulated). */
 function flushUserTurn(myGeneration: number): void {
   if (myGeneration !== generation) return
   const answer = userTurnBuffer.text.trim()
@@ -741,18 +1231,21 @@ function flushUserTurn(myGeneration: number): void {
 
   if (answer.length === 0 || currentSetup === null) return
 
-  // Captured BY VALUE now: this is the history session this answer belongs
-  // to, and it is what the (possibly much later) review write must use --
-  // never `historySessionId` as it stands when the review resolves.
+  // Captured BY VALUE now: this is the history session this turn belongs to
   const sessionIdForAnswer = historySessionId
-  // Same by-value capture for the usage meter: a late review is metered only if its own session is still the active one.
   const usageTokenForAnswer = usageToken
-  const turnId = recordTurn(sessionIdForAnswer, 'user', answer, fragments[0]?.timestampMs ?? Date.now())
+  const turnSpeaker: GeminiLiveSpeaker = lastActiveSpeaker === 'user' ? 'user' : 'assistant'
+  const turnId = recordTurn(sessionIdForAnswer, turnSpeaker, answer, fragments[0]?.timestampMs ?? Date.now())
+  if (turnId !== null && sink !== null) {
+    sink.onTurnFinished({ speaker: turnSpeaker, turnId })
+  }
 
-  if (countWords(answer) < MIN_ANSWER_WORDS_FOR_REVIEW) return
-
-  const myAnswerIndex = answerIndex++
-  runAnswerReview(myGeneration, myAnswerIndex, question, answer, fragments, currentSetup, currentResumeChunks, sessionIdForAnswer, turnId, usageTokenForAnswer)
+  // Note: in GhostKit live copilot mode, we only run answer reviews if the candidate explicitly answered as 'user',
+  // and NOT on the assistant's own copilot advice.
+  if (lastActiveSpeaker === 'user' && countWords(answer) >= MIN_ANSWER_WORDS_FOR_REVIEW) {
+    const myAnswerIndex = answerIndex++
+    runAnswerReview(myGeneration, myAnswerIndex, question, answer, fragments, currentSetup, currentResumeChunks, sessionIdForAnswer, turnId, usageTokenForAnswer)
+  }
 }
 
 /**
@@ -778,10 +1271,10 @@ function persistPartialInterviewerTurn(): void {
   if (text.length > 0) recordTurn(historySessionId, 'interviewer', text, interviewerTurnStartedAt ?? Date.now())
 }
 
-/** Same for a half-spoken candidate answer. It is never reviewed (it isn't a finished answer). Does NOT clear the buffer -- callers do. */
+/** Same for a half-spoken assistant answer. Does NOT clear the buffer -- callers do. */
 function persistPartialUserTurn(): void {
   const text = userTurnBuffer.text.trim()
-  if (text.length > 0) recordTurn(historySessionId, 'user', text, userTurnBuffer.fragments[0]?.timestampMs ?? Date.now())
+  if (text.length > 0) recordTurn(historySessionId, 'assistant', text, userTurnBuffer.fragments[0]?.timestampMs ?? Date.now())
 }
 
 /**
@@ -932,10 +1425,21 @@ function handleClose(myGeneration: number, apiKey: string): void {
   // a pre-drop partial answer onto a post-reconnect one, and inflate
   // longestPauseMs with a bogus gap spanning the reconnect delay itself.
   // ...but what WAS said before the drop still belongs in the saved transcript.
-  persistPartialInterviewerTurn()
+  //
+  // Interviewer side goes through the FULL flushInterviewerTurn (not just
+  // persistPartialInterviewerTurn) -- a network drop is a very common way for
+  // a turn to end without ever getting its own `finished`/`turnComplete`
+  // signal (confirmed live, 2026-09-27: a close code 1006 landed right as an
+  // interviewer question finished, and the old persist-only path here left
+  // that question recorded but NEVER answered -- the candidate just saw it
+  // sit there forever). flushInterviewerTurn both persists AND fires the
+  // turnId/translation/fast-text-answer pipeline, and reads from the CURRENT
+  // (pre-drop) buffer, which is still valid here regardless of the socket's
+  // state -- the answer call is a plain generateContent, independent of the
+  // Live session entirely. It also clears the buffer itself, so the manual
+  // reset below is only still needed for the fields it doesn't touch.
+  flushInterviewerTurn(myGeneration)
   persistPartialUserTurn()
-  interviewerTurnBuffer = ''
-  interviewerTurnStartedAt = null
   userTurnBuffer = { text: '', fragments: [] }
   questionForPendingAnswer = null
   lastActiveSpeaker = null

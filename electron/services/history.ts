@@ -104,7 +104,7 @@ const TREND_TOPIC_LIMIT = 6
 const MS_PER_DAY = 24 * 60 * 60 * 1000
 
 /** Bumped when the schema changes; add a `case` to `migrate` for each bump (never edit an old case). */
-const LATEST_SCHEMA_VERSION = 1
+const LATEST_SCHEMA_VERSION = 2
 
 const DB_FILE_NAME = 'history.sqlite3'
 /** Max time a statement waits for another connection's lock. Deliberately tiny: see HOT-PATH SAFETY above. */
@@ -146,67 +146,82 @@ function migrate(instance: Database.Database): void {
   if (version === LATEST_SCHEMA_VERSION) return
 
   const tx = instance.transaction(() => {
-    switch (version) {
-      case 0:
-        instance.exec(`
-          CREATE TABLE sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            started_at INTEGER NOT NULL,
-            ended_at INTEGER,
-            role TEXT NOT NULL,
-            difficulty TEXT NOT NULL,
-            company TEXT NOT NULL,
-            duration_minutes INTEGER NOT NULL,
-            focus_topics TEXT
-          );
-          CREATE INDEX idx_sessions_started ON sessions (started_at DESC);
+    let ver = version
+    if (ver === 0) {
+      instance.exec(`
+        CREATE TABLE sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          started_at INTEGER NOT NULL,
+          ended_at INTEGER,
+          role TEXT NOT NULL,
+          difficulty TEXT NOT NULL,
+          company TEXT NOT NULL,
+          duration_minutes INTEGER NOT NULL,
+          focus_topics TEXT
+        );
+        CREATE INDEX idx_sessions_started ON sessions (started_at DESC);
 
-          CREATE TABLE topics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE
-          );
+        CREATE TABLE topics (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE
+        );
 
-          CREATE TABLE turns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
-            idx INTEGER NOT NULL,
-            speaker TEXT NOT NULL CHECK (speaker IN ('user', 'interviewer')),
-            text TEXT NOT NULL,
-            started_at INTEGER NOT NULL,
-            finished_at INTEGER NOT NULL,
-            UNIQUE (session_id, idx)
-          );
+        CREATE TABLE turns (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+          idx INTEGER NOT NULL,
+          speaker TEXT NOT NULL CHECK (speaker IN ('user', 'interviewer', 'assistant')),
+          text TEXT NOT NULL,
+          started_at INTEGER NOT NULL,
+          finished_at INTEGER NOT NULL,
+          UNIQUE (session_id, idx)
+        );
 
-          CREATE TABLE reviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
-            answer_index INTEGER NOT NULL,
-            turn_id INTEGER REFERENCES turns (id) ON DELETE SET NULL,
-            question TEXT NOT NULL,
-            score INTEGER NOT NULL CHECK (score BETWEEN 1 AND 10),
-            star_situation INTEGER NOT NULL,
-            star_task INTEGER NOT NULL,
-            star_action INTEGER NOT NULL,
-            star_result INTEGER NOT NULL,
-            missing_points TEXT NOT NULL,
-            technical_errors TEXT NOT NULL,
-            improved_answer TEXT NOT NULL,
-            follow_up TEXT NOT NULL,
-            wpm REAL,
-            filler_count INTEGER NOT NULL,
-            longest_pause_ms INTEGER NOT NULL,
-            topic_id INTEGER NOT NULL REFERENCES topics (id),
-            created_at INTEGER NOT NULL,
-            UNIQUE (session_id, answer_index)
-          );
-          CREATE INDEX idx_reviews_session ON reviews (session_id);
-          CREATE INDEX idx_reviews_topic ON reviews (topic_id, created_at);
-          CREATE INDEX idx_reviews_turn ON reviews (turn_id);
-        `)
-      // idx_reviews_turn lives in this v1 block on purpose: no shipped build ever created a
-      // v1 database (verified before the change -- no history.sqlite3 existed), so v1 was still
-      // editable. From here on, schema changes are a new `case` + a version bump.
-      // (none yet -- a v2 would add `case 1:` here and bump LATEST_SCHEMA_VERSION)
+        CREATE TABLE reviews (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+          answer_index INTEGER NOT NULL,
+          turn_id INTEGER REFERENCES turns (id) ON DELETE SET NULL,
+          question TEXT NOT NULL,
+          score INTEGER NOT NULL CHECK (score BETWEEN 1 AND 10),
+          star_situation INTEGER NOT NULL,
+          star_task INTEGER NOT NULL,
+          star_action INTEGER NOT NULL,
+          star_result INTEGER NOT NULL,
+          missing_points TEXT NOT NULL,
+          technical_errors TEXT NOT NULL,
+          improved_answer TEXT NOT NULL,
+          follow_up TEXT NOT NULL,
+          wpm REAL,
+          filler_count INTEGER NOT NULL,
+          longest_pause_ms INTEGER NOT NULL,
+          topic_id INTEGER NOT NULL REFERENCES topics (id),
+          created_at INTEGER NOT NULL,
+          UNIQUE (session_id, answer_index)
+        );
+        CREATE INDEX idx_reviews_session ON reviews (session_id);
+        CREATE INDEX idx_reviews_topic ON reviews (topic_id, created_at);
+        CREATE INDEX idx_reviews_turn ON reviews (turn_id);
+      `)
+      ver = 1
+    }
+    if (ver === 1) {
+      instance.exec(`
+        CREATE TABLE turns_v2 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id INTEGER NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+          idx INTEGER NOT NULL,
+          speaker TEXT NOT NULL CHECK (speaker IN ('user', 'interviewer', 'assistant')),
+          text TEXT NOT NULL,
+          started_at INTEGER NOT NULL,
+          finished_at INTEGER NOT NULL,
+          UNIQUE (session_id, idx)
+        );
+        INSERT INTO turns_v2 SELECT id, session_id, idx, speaker, text, started_at, finished_at FROM turns;
+        DROP TABLE turns;
+        ALTER TABLE turns_v2 RENAME TO turns;
+      `)
+      ver = 2
     }
     instance.pragma(`user_version = ${LATEST_SCHEMA_VERSION}`)
   })

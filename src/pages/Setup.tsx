@@ -13,12 +13,66 @@ import {
   MAX_JD_TEXT_CHARS,
   MAX_COMPANY_CHARS,
   MIN_DURATION_MINUTES,
-  MAX_DURATION_MINUTES
+  MAX_DURATION_MINUTES,
+  MAX_QA_ENTRIES,
+  MAX_QA_QUESTION_CHARS,
+  MAX_QA_ANSWER_CHARS
 } from '../../electron/ipc-types'
-import type { InterviewSetup, RagStatusResult } from '../../electron/ipc-types'
+import type { InterviewSetup, RagStatusResult, QaBankEntry, QaBankStatusResult, LearnedAnswerStatusResult } from '../../electron/ipc-types'
 
 type RagStatus = 'idle' | 'processing' | 'done' | 'error'
 type ClearStatus = 'idle' | 'clearing' | 'error'
+
+/**
+ * Parses the free-form "Q: ... / A: ..." paste format into structured
+ * entries. Deliberately forgiving rather than strict: blocks are separated
+ * by one or more blank lines, a line is recognized as starting a question or
+ * answer by a leading "Q"/"A" followed by `:`, `.`, `-`, or `)` (case
+ * insensitive, so "Q1:", "Q)", "q." etc. all work), and any line before the
+ * next marker keeps appending to whichever part is currently open -- so a
+ * multi-line answer works with no special syntax. A block missing either
+ * part (no "Q:" line, or no "A:" line) is silently dropped rather than
+ * rejecting the whole paste over one malformed entry.
+ */
+function parseQaBankText(text: string): QaBankEntry[] {
+  const blocks = text.split(/\n\s*\n+/)
+  const entries: QaBankEntry[] = []
+  const markerRe = /^\s*([QA])\s*\d*\s*[:.\-)]\s*(.*)$/i
+
+  for (const block of blocks) {
+    const questionLines: string[] = []
+    const answerLines: string[] = []
+    let mode: 'none' | 'q' | 'a' = 'none'
+
+    for (const rawLine of block.split(/\r?\n/)) {
+      const match = markerRe.exec(rawLine)
+      if (match) {
+        const [, marker, rest] = match
+        if (marker.toUpperCase() === 'Q') {
+          mode = 'q'
+          questionLines.push(rest)
+        } else {
+          mode = 'a'
+          answerLines.push(rest)
+        }
+        continue
+      }
+      if (mode === 'q') questionLines.push(rawLine)
+      else if (mode === 'a') answerLines.push(rawLine)
+    }
+
+    const question = questionLines.join(' ').trim()
+    const answer = answerLines.join('\n').trim()
+    if (question.length > 0 && answer.length > 0) {
+      entries.push({
+        question: question.slice(0, MAX_QA_QUESTION_CHARS),
+        answer: answer.slice(0, MAX_QA_ANSWER_CHARS)
+      })
+    }
+  }
+
+  return entries.slice(0, MAX_QA_ENTRIES)
+}
 
 interface SetupProps {
   setup: InterviewSetup
@@ -55,6 +109,22 @@ function Setup({ setup, onSetupChange }: SetupProps): JSX.Element {
   const [clearStatus, setClearStatus] = useState<ClearStatus>('idle')
   const [clearError, setClearError] = useState<string | null>(null)
 
+  const [qaText, setQaText] = useState('')
+  const [qaStatus, setQaStatus] = useState<RagStatus>('idle')
+  const [qaMessage, setQaMessage] = useState<string | null>(null)
+  const [qaIndexStatus, setQaIndexStatus] = useState<QaBankStatusResult | null>(null)
+  const [qaClearStatus, setQaClearStatus] = useState<ClearStatus>('idle')
+  const [qaClearError, setQaClearError] = useState<string | null>(null)
+
+  const refreshQaStatus = (): void => {
+    window.api
+      .getQaBankStatus()
+      .then(setQaIndexStatus)
+      .catch(() => {
+        // Best-effort; the section still works without this readout.
+      })
+  }
+
   const refreshIndexStatus = (): void => {
     window.api
       .getRagStatus()
@@ -64,8 +134,45 @@ function Setup({ setup, onSetupChange }: SetupProps): JSX.Element {
       })
   }
 
+  const [learnedStatus, setLearnedStatus] = useState<LearnedAnswerStatusResult | null>(null)
+  const [learnedClearStatus, setLearnedClearStatus] = useState<ClearStatus>('idle')
+  const [learnedClearError, setLearnedClearError] = useState<string | null>(null)
+
+  const refreshLearnedStatus = (): void => {
+    window.api
+      .getLearnedAnswerStatus()
+      .then(setLearnedStatus)
+      .catch(() => {
+        // Best-effort; the section still works without this readout.
+      })
+  }
+
+  const handleClearLearnedAnswers = (): void => {
+    if (learnedClearStatus === 'clearing') return
+    setLearnedClearStatus('clearing')
+    setLearnedClearError(null)
+
+    void window.api
+      .clearLearnedAnswers()
+      .then((result) => {
+        if (result.ok) {
+          setLearnedClearStatus('idle')
+          refreshLearnedStatus()
+        } else {
+          setLearnedClearStatus('error')
+          setLearnedClearError(result.error ?? 'Failed to clear the learned-answer cache.')
+        }
+      })
+      .catch((err: unknown) => {
+        setLearnedClearStatus('error')
+        setLearnedClearError(err instanceof Error ? err.message : 'Failed to clear the learned-answer cache.')
+      })
+  }
+
   useEffect(() => {
     refreshIndexStatus()
+    refreshQaStatus()
+    refreshLearnedStatus()
   }, [])
 
   const handleResumeFileChange = (event: ChangeEvent<HTMLInputElement>): void => {
@@ -158,6 +265,64 @@ function Setup({ setup, onSetupChange }: SetupProps): JSX.Element {
       .catch((err: unknown) => {
         setClearStatus('error')
         setClearError(err instanceof Error ? err.message : 'Failed to clear stored materials.')
+      })
+  }
+
+  const parsedQaCount = parseQaBankText(qaText).length
+  const canSaveQaBank = qaText.trim().length > 0 && qaStatus !== 'processing'
+
+  const handleSaveQaBank = (): void => {
+    if (!canSaveQaBank) return
+    const entries = parseQaBankText(qaText)
+    if (entries.length === 0) {
+      setQaStatus('error')
+      setQaMessage('Could not find any "Q: ... / A: ..." pairs in that text -- check the format below.')
+      return
+    }
+
+    setQaStatus('processing')
+    setQaMessage(null)
+
+    void window.api
+      .indexQaBank(entries)
+      .then((result) => {
+        if (result.ok) {
+          setQaStatus('done')
+          setQaMessage(`Saved -- ${result.count ?? entries.length} prepared answer${(result.count ?? entries.length) === 1 ? '' : 's'}.`)
+          refreshQaStatus()
+        } else {
+          setQaStatus('error')
+          setQaMessage(result.error ?? 'Failed to save prepared answers.')
+        }
+      })
+      .catch((err: unknown) => {
+        setQaStatus('error')
+        setQaMessage(err instanceof Error ? err.message : 'Failed to save prepared answers.')
+      })
+  }
+
+  const handleClearQaBank = (): void => {
+    if (qaClearStatus === 'clearing') return
+    setQaClearStatus('clearing')
+    setQaClearError(null)
+
+    void window.api
+      .clearQaBank()
+      .then((result) => {
+        if (result.ok) {
+          setQaClearStatus('idle')
+          setQaStatus('idle')
+          setQaMessage(null)
+          setQaText('')
+          refreshQaStatus()
+        } else {
+          setQaClearStatus('error')
+          setQaClearError(result.error ?? 'Failed to clear prepared answers.')
+        }
+      })
+      .catch((err: unknown) => {
+        setQaClearStatus('error')
+        setQaClearError(err instanceof Error ? err.message : 'Failed to clear prepared answers.')
       })
   }
 
@@ -296,6 +461,86 @@ function Setup({ setup, onSetupChange }: SetupProps): JSX.Element {
           {ragStatus === 'done' && ragMessage && <StatusBanner tone="success">{ragMessage}</StatusBanner>}
           {ragStatus === 'error' && ragMessage && <StatusBanner tone="error">{ragMessage}</StatusBanner>}
           {clearStatus === 'error' && clearError && <StatusBanner tone="error">{clearError}</StatusBanner>}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Prepared answers (optional)</CardTitle>
+          <CardDescription>
+            Pre-load questions you expect and the exact answer you want used. When the interviewer asks something
+            close to one of these, the AI relays your prepared answer instead of writing a new one from scratch --
+            faster and more reliable than generating on the fly.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4">
+          <div className="flex flex-col gap-2">
+            <label htmlFor="qa-bank-text" className="text-sm font-medium">
+              Paste your questions and answers
+            </label>
+            <Textarea
+              id="qa-bank-text"
+              placeholder={'Q: What is a REST API?\nA: A REST API is an architectural style...\n\nQ: Explain closures in JavaScript\nA: A closure is a function that retains access...'}
+              value={qaText}
+              onChange={(event) => setQaText(event.target.value)}
+              rows={8}
+            />
+            <p className="text-xs text-muted-foreground">
+              One block per pair, separated by a blank line. Start each with "Q:" and "A:" (multi-line answers are
+              fine). {qaText.trim().length > 0 && `${parsedQaCount} pair${parsedQaCount === 1 ? '' : 's'} detected.`}{' '}
+              Up to {MAX_QA_ENTRIES} pairs.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <Button type="button" onClick={handleSaveQaBank} disabled={!canSaveQaBank}>
+              {qaStatus === 'processing' ? 'Saving…' : 'Save prepared answers'}
+            </Button>
+            {qaIndexStatus !== null && qaIndexStatus.count > 0 && (
+              <Button type="button" variant="ghost" onClick={handleClearQaBank} disabled={qaClearStatus === 'clearing'}>
+                {qaClearStatus === 'clearing' ? 'Clearing…' : 'Clear prepared answers'}
+              </Button>
+            )}
+          </div>
+
+          {qaIndexStatus !== null && (
+            <p className="text-xs text-muted-foreground">
+              Currently stored -- {qaIndexStatus.count} prepared answer{qaIndexStatus.count === 1 ? '' : 's'}. Used for
+              every interview until cleared or replaced -- it isn't scoped to one session. Saving replaces the whole
+              list.
+            </p>
+          )}
+
+          {qaStatus === 'done' && qaMessage && <StatusBanner tone="success">{qaMessage}</StatusBanner>}
+          {qaStatus === 'error' && qaMessage && <StatusBanner tone="error">{qaMessage}</StatusBanner>}
+          {qaClearStatus === 'error' && qaClearError && <StatusBanner tone="error">{qaClearError}</StatusBanner>}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Learned answer cache</CardTitle>
+          <CardDescription>
+            Every answer GhostKit generates live gets remembered automatically, so a repeated or very similar
+            question -- later in this interview, or in a future one -- can be answered instantly from this cache
+            instead of waiting on a fresh AI call. Clear it here if a cached answer ever looks wrong for the
+            question it was reused for.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          {learnedStatus !== null && (
+            <p className="text-xs text-muted-foreground">
+              Currently cached -- {learnedStatus.count} learned answer{learnedStatus.count === 1 ? '' : 's'}.
+            </p>
+          )}
+          {learnedStatus !== null && learnedStatus.count > 0 && (
+            <div>
+              <Button type="button" variant="ghost" onClick={handleClearLearnedAnswers} disabled={learnedClearStatus === 'clearing'}>
+                {learnedClearStatus === 'clearing' ? 'Clearing…' : 'Clear learned answer cache'}
+              </Button>
+            </div>
+          )}
+          {learnedClearStatus === 'error' && learnedClearError && <StatusBanner tone="error">{learnedClearError}</StatusBanner>}
         </CardContent>
       </Card>
     </div>
