@@ -3,7 +3,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
 import LevelMeter from '@/components/LevelMeter'
-import Transcript, { type TranscriptTurn } from '@/components/Transcript'
+import Transcript, { type TranscriptTurn, type ProvisionalCaption } from '@/components/Transcript'
 import FeedbackCard from '@/components/FeedbackCard'
 import UsageMeter from '@/components/UsageMeter'
 import { useWindowShortcut } from '@/lib/useWindowShortcut'
@@ -42,6 +42,7 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
   const [workletActive, setWorkletActive] = useState<boolean | null>(null)
   const [hasApiKey, setHasApiKey] = useState<boolean | null>(null)
   const [transcriptTurns, setTranscriptTurns] = useState<TranscriptTurn[]>([])
+  const [provisionalCaption, setProvisionalCaption] = useState<ProvisionalCaption | null>(null)
   /**
    * Per-answer reviews, keyed by `answerIndex` (see GeminiLiveAnswerReviewEvent's
    * doc comment) rather than arrival order -- kept sorted ascending by
@@ -81,11 +82,13 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
     playerRef.current?.dispose()
     playerRef.current = null
     liveOpenRef.current = false
+    setProvisionalCaption(null)
     void window.api.stopLiveSession()
   }
 
   const handleTranscript = (event: GeminiLiveTranscriptEvent): void => {
     if (!mountedRef.current) return
+    setProvisionalCaption(null)
     let delta = event.textDelta
     if (event.speaker === 'assistant') {
       delta = delta
@@ -115,11 +118,13 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
   }
 
   const handleInterrupted = (): void => {
+    setProvisionalCaption(null)
     playerRef.current?.clear()
   }
 
   const handleTurnFinished = (event: GeminiLiveTurnFinishedEvent): void => {
     if (!mountedRef.current) return
+    setProvisionalCaption(null)
     // Authoritative override -- see GeminiLiveTurnFinishedEvent's doc comment.
     setTranscriptTurns((turns) => {
       const lastIdx = turns.map((t) => t.speaker).lastIndexOf(event.speaker)
@@ -177,6 +182,14 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
     mountedRef.current = true
 
     const unsubscribeTranscript = window.api.onLiveTranscript(handleTranscript)
+    const unsubscribeInterim = window.api.onLiveInterimTranscript((event) => {
+      if (!mountedRef.current) return
+      if (event.text.trim().length > 0) {
+        setProvisionalCaption({ speaker: event.speaker, text: event.text })
+      } else {
+        setProvisionalCaption(null)
+      }
+    })
     const unsubscribeAudio = window.api.onLiveAudioChunk(handleAudioChunk)
     const unsubscribeState = window.api.onLiveConnectionState(handleConnectionState)
     const unsubscribeInterrupted = window.api.onLiveInterrupted(handleInterrupted)
@@ -201,6 +214,7 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
       startIdRef.current++
       teardown()
       unsubscribeTranscript()
+      unsubscribeInterim()
       unsubscribeAudio()
       unsubscribeState()
       unsubscribeInterrupted()
@@ -239,29 +253,72 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
     setError(null)
     setWorkletActive(null)
     setTranscriptTurns([])
+    setProvisionalCaption(null)
     setReviews([])
     nextTurnIdRef.current = 0
     liveOpenRef.current = false
 
     void (async () => {
-      const [captureResult, liveResult] = await Promise.all([startCapture(handleStreamEnded), window.api.startLiveSession(setup, focusTopics)])
+      // Concurrently start audio capture and the Gemini Live session connection
+      const capturePromise = startCapture(handleStreamEnded)
+      const livePromise = window.api.startLiveSession(setup, focusTopics)
+
+      // Initialize audio pipeline as soon as capture streams are acquired,
+      // concurrently with the network live session connection establishment
+      const pipelinePromise = capturePromise.then(async (captureResult) => {
+        if (!captureResult.ok) {
+          return { ok: false as const, error: captureResult.error }
+        }
+        if (!mountedRef.current || id !== startIdRef.current) {
+          stopCapture()
+          return { ok: false as const, error: new Error('Cancelled.') }
+        }
+
+        streamsRef.current = captureResult.streams
+
+        try {
+          const player = createAudioPlayer()
+          const pipeline = await createAudioPipeline(captureResult.streams, {
+            onSystemChunk: (chunk, capturedAtMs) => {
+              if (liveOpenRef.current) {
+                window.api.streamMicChunk(chunk, capturedAtMs)
+              }
+            }
+          })
+          return { ok: true as const, pipeline, player }
+        } catch (err) {
+          stopCapture()
+          streamsRef.current = null
+          return { ok: false as const, error: err instanceof Error ? err : new Error(String(err)) }
+        }
+      })
+
+      const [pipelineResult, liveResult] = await Promise.all([pipelinePromise, livePromise])
 
       if (!mountedRef.current || id !== startIdRef.current) {
-        // Superseded by a Stop/unmount/second Start while this was in flight.
-        if (captureResult.ok) stopCapture()
+        if (pipelineResult.ok) {
+          pipelineResult.pipeline.dispose()
+          pipelineResult.player.dispose()
+        }
+        stopCapture()
+        streamsRef.current = null
         if (liveResult.ok) void window.api.stopLiveSession()
         return
       }
 
-      if (!captureResult.ok) {
-        setError(captureResult.error.message)
+      if (!pipelineResult.ok) {
+        setError(pipelineResult.error.message)
         setCaptureState('idle')
         setLiveState('idle')
         if (liveResult.ok) void window.api.stopLiveSession()
         return
       }
+
       if (!liveResult.ok) {
+        pipelineResult.pipeline.dispose()
+        pipelineResult.player.dispose()
         stopCapture()
+        streamsRef.current = null
         setError(liveResult.error ?? 'Failed to start the interview session.')
         setCaptureState('idle')
         setLiveState('idle')
@@ -272,40 +329,10 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
       setActiveDrill(focusTopics)
       if (focusTopics.length > 0) onClearFocus()
 
-      streamsRef.current = captureResult.streams
-
-      try {
-        playerRef.current = createAudioPlayer()
-        const pipeline = await createAudioPipeline(captureResult.streams, {
-          onSystemChunk: (chunk, capturedAtMs) => {
-            if (liveOpenRef.current) {
-              void window.api.sendMicChunk(chunk, capturedAtMs)
-            }
-          }
-        })
-        if (!mountedRef.current || id !== startIdRef.current) {
-          pipeline.dispose()
-          stopCapture()
-          streamsRef.current = null
-          playerRef.current?.dispose()
-          playerRef.current = null
-          void window.api.stopLiveSession()
-          return
-        }
-        pipelineRef.current = pipeline
-        setWorkletActive(pipeline.isWorkletActive())
-        setCaptureState('running')
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to start the audio pipeline.')
-        stopCapture()
-        streamsRef.current = null
-        pipelineRef.current = null
-        playerRef.current?.dispose()
-        playerRef.current = null
-        setCaptureState('idle')
-        setLiveState('idle')
-        void window.api.stopLiveSession()
-      }
+      playerRef.current = pipelineResult.player
+      pipelineRef.current = pipelineResult.pipeline
+      setWorkletActive(pipelineResult.pipeline.isWorkletActive())
+      setCaptureState('running')
     })().catch((err: unknown) => {
       // Safety net: everything above already catches its own failures, but
       // an unanticipated throw here must not become a silently stuck
@@ -441,7 +468,7 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
 
           <div className="flex flex-col gap-2 border-t border-border pt-4">
             <span className="text-sm font-medium">Transcript</span>
-            <Transcript turns={transcriptTurns} />
+            <Transcript turns={transcriptTurns} provisionalCaption={provisionalCaption} />
           </div>
 
           <div className="flex flex-col gap-2 border-t border-border pt-4">

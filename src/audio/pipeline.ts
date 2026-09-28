@@ -175,7 +175,10 @@ function createTap(
       workletNode.port.onmessage = (event: MessageEvent<unknown>): void => {
         if (event.data instanceof ArrayBuffer) {
           chunkCount.count += 1
-          onChunk?.(event.data, Date.now())
+          const rawBuffer = event.data
+          onChunk?.(rawBuffer, Date.now())
+          // Recycle buffer back to worklet for zero-allocation streaming
+          workletNode?.port.postMessage(rawBuffer, [rawBuffer])
         } else {
           console.warn('[pipeline] PCM worklet reported a problem:', event.data)
         }

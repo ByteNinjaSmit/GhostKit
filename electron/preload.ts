@@ -26,6 +26,7 @@ import type {
   GeminiLiveAnswerReviewEvent,
   GeminiLiveAudioChunkEvent,
   GeminiLiveConnectionStateEvent,
+  GeminiLiveInterimTranscriptEvent,
   GeminiLiveTurnFinishedEvent,
   GeminiLiveTranscriptEvent,
   GeminiLiveTranslationEvent,
@@ -225,6 +226,15 @@ function toLiveTranscriptEvent(value: unknown): GeminiLiveTranscriptEvent | null
     return null
   }
   return { speaker: v['speaker'] as GeminiLiveTranscriptEvent['speaker'], textDelta: v['textDelta'], finished: v['finished'] }
+}
+
+function toLiveInterimTranscriptEvent(value: unknown): GeminiLiveInterimTranscriptEvent | null {
+  if (typeof value !== 'object' || value === null) return null
+  const v = value as Record<string, unknown>
+  if ((v['speaker'] !== 'user' && v['speaker'] !== 'interviewer' && v['speaker'] !== 'assistant') || typeof v['text'] !== 'string') {
+    return null
+  }
+  return { speaker: v['speaker'] as GeminiLiveInterimTranscriptEvent['speaker'], text: v['text'] }
 }
 
 function toLiveTurnFinishedEvent(value: unknown): GeminiLiveTurnFinishedEvent | null {
@@ -781,8 +791,15 @@ const api: MockPilotApi = {
   sendMicChunk: (chunk: ArrayBuffer, capturedAtMs: number): Promise<OperationResult> =>
     ipcRenderer.invoke(IPC_CHANNELS.GEMINI_LIVE_SEND_AUDIO, { chunk, capturedAtMs }).then(toOperationResult),
 
+  streamMicChunk: (chunk: ArrayBuffer, capturedAtMs: number): void => {
+    ipcRenderer.send(IPC_CHANNELS.GEMINI_LIVE_SEND_AUDIO_STREAM, { chunk, capturedAtMs })
+  },
+
   onLiveTranscript: (callback: (event: GeminiLiveTranscriptEvent) => void): (() => void) =>
     subscribe(IPC_CHANNELS.GEMINI_LIVE_TRANSCRIPT, toLiveTranscriptEvent, callback),
+
+  onLiveInterimTranscript: (callback: (event: GeminiLiveInterimTranscriptEvent) => void): (() => void) =>
+    subscribe(IPC_CHANNELS.GEMINI_LIVE_INTERIM_TRANSCRIPT, toLiveInterimTranscriptEvent, callback),
 
   onLiveAudioChunk: (callback: (event: GeminiLiveAudioChunkEvent) => void): (() => void) =>
     subscribe(IPC_CHANNELS.GEMINI_LIVE_AUDIO_CHUNK, toLiveAudioChunkEvent, callback),

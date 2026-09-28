@@ -43,6 +43,7 @@ export default function GhostOverlay(): JSX.Element {
   const [isStarting, setIsStarting] = useState(false)
   const [sessionError, setSessionError] = useState<string | null>(null)
   const [copiedId, setCopiedId] = useState<number | null>(null)
+  const [provisionalCaption, setProvisionalCaption] = useState<string | null>(null)
 
   // Quick Hints / Cheat tab state
   const [quickPrompt, setQuickPrompt] = useState('')
@@ -63,6 +64,7 @@ export default function GhostOverlay(): JSX.Element {
     pipelineRef.current = null
     stopCapture()
     streamsRef.current = null
+    setProvisionalCaption(null)
   }
 
   // Set html/body background to transparent for the overlay window
@@ -81,6 +83,7 @@ export default function GhostOverlay(): JSX.Element {
     })
 
     const unsubscribeTranscript = window.api.onLiveTranscript((event: GeminiLiveTranscriptEvent) => {
+      setProvisionalCaption(null)
       let delta = event.textDelta
       if (event.speaker === 'assistant') {
         delta = delta
@@ -107,7 +110,16 @@ export default function GhostOverlay(): JSX.Element {
       })
     })
 
+    const unsubscribeInterim = window.api.onLiveInterimTranscript((event) => {
+      if (event.text.trim().length > 0) {
+        setProvisionalCaption(event.text)
+      } else {
+        setProvisionalCaption(null)
+      }
+    })
+
     const unsubscribeTurnFinished = window.api.onLiveTurnFinished((event: GeminiLiveTurnFinishedEvent) => {
+      setProvisionalCaption(null)
       // Authoritative override: force the last item for this speaker to
       // `finished: true` regardless of what its own fragments last reported
       // (see GeminiLiveTurnFinishedEvent's doc comment -- Gemini's per-fragment
@@ -153,6 +165,7 @@ export default function GhostOverlay(): JSX.Element {
     const unsubscribePanic = window.api.onPanic(() => {
       teardown()
       setTranscripts([])
+      setProvisionalCaption(null)
       setHintsResult(null)
       setIsStarting(false)
     })
@@ -161,6 +174,7 @@ export default function GhostOverlay(): JSX.Element {
       teardown()
       unsubscribeStealth()
       unsubscribeTranscript()
+      unsubscribeInterim()
       unsubscribeTurnFinished()
       unsubscribeTranslation()
       unsubscribeConn()
@@ -174,7 +188,7 @@ export default function GhostOverlay(): JSX.Element {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [transcripts, latestReview])
+  }, [transcripts, latestReview, provisionalCaption])
 
   const handleToggleClickThrough = async (): Promise<void> => {
     const nextVal = !stealthState.ghostClickThrough
@@ -209,37 +223,46 @@ export default function GhostOverlay(): JSX.Element {
         return
       }
 
-      // 1. Capture system audio (Windows loopback) and optional mic
-      const captureResult = await startCapture(() => {
+      setProvisionalCaption(null)
+
+      // Start capture and live session connection in parallel
+      const capturePromise = startCapture(() => {
         teardown()
         void window.api.stopLiveSession()
       })
+      const livePromise = window.api.startLiveSession(DEFAULT_INTERVIEW_SETUP)
 
-      if (!captureResult.ok) {
-        setSessionError(captureResult.error.message)
-        setIsStarting(false)
-        return
-      }
-
-      streamsRef.current = captureResult.streams
-
-      // 2. Open live Gemini Live session
-      const liveResult = await window.api.startLiveSession(DEFAULT_INTERVIEW_SETUP)
-      if (!liveResult.ok) {
-        teardown()
-        setSessionError(liveResult.error ?? 'Failed to connect live AI session.')
-        setIsStarting(false)
-        return
-      }
-
-      // 3. Connect system audio loopback stream to Gemini Live
-      const pipeline = await createAudioPipeline(captureResult.streams, {
-        onSystemChunk: (chunk, capturedAtMs) => {
-          void window.api.sendMicChunk(chunk, capturedAtMs)
+      // Initialize audio pipeline as soon as capture streams are acquired
+      const pipelinePromise = capturePromise.then(async (captureResult) => {
+        if (!captureResult.ok) {
+          return { ok: false as const, error: captureResult.error }
         }
+        streamsRef.current = captureResult.streams
+        const pipeline = await createAudioPipeline(captureResult.streams, {
+          onSystemChunk: (chunk, capturedAtMs) => {
+            window.api.streamMicChunk(chunk, capturedAtMs)
+          }
+        })
+        return { ok: true as const, pipeline }
       })
 
-      pipelineRef.current = pipeline
+      const [pipelineResult, liveResult] = await Promise.all([pipelinePromise, livePromise])
+
+      if (!pipelineResult.ok) {
+        setSessionError(pipelineResult.error.message)
+        if (liveResult.ok) void window.api.stopLiveSession()
+        return
+      }
+
+      if (!liveResult.ok) {
+        pipelineResult.pipeline.dispose()
+        stopCapture()
+        streamsRef.current = null
+        setSessionError(liveResult.error ?? 'Failed to connect live AI session.')
+        return
+      }
+
+      pipelineRef.current = pipelineResult.pipeline
     } catch (err) {
       teardown()
       setSessionError(err instanceof Error ? err.message : 'Could not start interview.')
@@ -522,6 +545,23 @@ export default function GhostOverlay(): JSX.Element {
                 </div>
               )
             })}
+
+            {provisionalCaption && (
+              <div className="flex flex-col gap-1 rounded-lg border border-cyan-500/50 bg-cyan-950/30 p-2.5 shadow-md">
+                <div className="flex items-center gap-2">
+                  <span className="relative flex h-2 w-2">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan-400 opacity-75"></span>
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-cyan-500"></span>
+                  </span>
+                  <span className="text-[10px] font-semibold uppercase tracking-wider text-cyan-400">
+                    🎧 Interviewer (Speaking live…)
+                  </span>
+                </div>
+                <p className="text-xs italic leading-relaxed text-cyan-100/90">
+                  {provisionalCaption}
+                </p>
+              </div>
+            )}
 
             {latestReview && (latestReview.score !== undefined || latestReview.improvedAnswer) && (
               <div className="mt-2 rounded-lg border border-purple-800/60 bg-purple-950/30 p-2.5">

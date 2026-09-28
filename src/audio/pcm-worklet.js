@@ -45,6 +45,17 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
     this.chunkBuffer = new Int16Array(this.chunkSize)
     this.chunkOffset = 0
 
+    // Reusable scratch buffer for downmixing/filtering to eliminate ~375 allocations/sec
+    this.scratchFiltered = new Float32Array(128)
+
+    // Recycled ArrayBuffer pool for zero-allocation 100ms chunk emission
+    this.bufferPool = []
+    this.port.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer && event.data.byteLength === this.chunkSize * 2) {
+        this.bufferPool.push(event.data)
+      }
+    }
+
     this.unsupportedRate = this.ratio < 1
     if (this.unsupportedRate) {
       this.port.postMessage({ error: 'unsupported-sample-rate', sampleRate })
@@ -63,8 +74,11 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
     const channel0 = input[0]
     const quantumLen = channel0.length // typically 128 in Web Audio
 
-    // 1. Downmix & Filter each input sample in this quantum
-    const filtered = new Float32Array(quantumLen)
+    // 1. Downmix & Filter each input sample in this quantum using reusable scratch buffer
+    if (this.scratchFiltered.length < quantumLen) {
+      this.scratchFiltered = new Float32Array(quantumLen)
+    }
+    const filtered = this.scratchFiltered
     for (let i = 0; i < quantumLen; i++) {
       let mixed = 0
       for (let ch = 0; ch < numChannels; ch++) {
@@ -117,8 +131,10 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
       this.chunkBuffer[this.chunkOffset++] = intSample
 
       if (this.chunkOffset >= this.chunkSize) {
-        this.port.postMessage(this.chunkBuffer.buffer, [this.chunkBuffer.buffer])
-        this.chunkBuffer = new Int16Array(this.chunkSize)
+        const outBuf = this.chunkBuffer.buffer
+        this.port.postMessage(outBuf, [outBuf])
+        const recycled = this.bufferPool.pop()
+        this.chunkBuffer = recycled ? new Int16Array(recycled) : new Int16Array(this.chunkSize)
         this.chunkOffset = 0
       }
 

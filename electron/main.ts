@@ -311,6 +311,7 @@ function sendToRenderer(channel: string, payload: unknown): void {
  */
 const liveEventSink: geminiLive.GeminiLiveEventSink = {
   onTranscript: (event) => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_TRANSCRIPT, event),
+  onInterimTranscript: (event) => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_INTERIM_TRANSCRIPT, event),
   onAudioChunk: (event) => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_AUDIO_CHUNK, event),
   onConnectionState: (event) => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_CONNECTION_STATE, event),
   onInterrupted: () => sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_INTERRUPTED, null),
@@ -915,6 +916,16 @@ function registerIpcHandlers(): void {
       return { ok: false, error: 'Invalid audio chunk.' }
     }
     return geminiLive.sendAudioChunk(chunk, capturedAtMs)
+  })
+
+  // High-performance one-way audio streaming channel -- avoids 2-way IPC round-trip
+  // Promise allocation and response messaging for every 100ms chunk.
+  ipcMain.on(IPC_CHANNELS.GEMINI_LIVE_SEND_AUDIO_STREAM, (event, payload: unknown): void => {
+    if (!isTrustedSender(event)) return
+    if (typeof payload !== 'object' || payload === null) return
+    const { chunk, capturedAtMs } = payload as Record<string, unknown>
+    if (!(chunk instanceof ArrayBuffer) || typeof capturedAtMs !== 'number' || !Number.isFinite(capturedAtMs)) return
+    geminiLive.sendAudioChunk(chunk, capturedAtMs)
   })
 
   ipcMain.handle(IPC_CHANNELS.RAG_INDEX_MATERIALS, async (event, payload: unknown): Promise<RagIndexResult> => {

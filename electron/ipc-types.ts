@@ -24,12 +24,14 @@ export const IPC_CHANNELS = {
   GEMINI_LIVE_START: 'gemini-live:start',
   GEMINI_LIVE_STOP: 'gemini-live:stop',
   GEMINI_LIVE_SEND_AUDIO: 'gemini-live:send-audio',
+  GEMINI_LIVE_SEND_AUDIO_STREAM: 'gemini-live:send-audio-stream',
 
   // Phase 2 -- main-initiated push events (mainWindow.webContents.send), the
   // first main->renderer channels in this app. See preload.ts for how these
   // are subscribed to (window.api.onLive*) and validated before a listener
   // callback ever sees the payload.
   GEMINI_LIVE_TRANSCRIPT: 'gemini-live:transcript',
+  GEMINI_LIVE_INTERIM_TRANSCRIPT: 'gemini-live:interim-transcript',
   GEMINI_LIVE_AUDIO_CHUNK: 'gemini-live:audio-chunk',
   GEMINI_LIVE_CONNECTION_STATE: 'gemini-live:connection-state',
   GEMINI_LIVE_INTERRUPTED: 'gemini-live:interrupted',
@@ -162,6 +164,16 @@ export interface GeminiLiveTranscriptEvent {
   speaker: GeminiLiveSpeaker
   textDelta: string
   finished: boolean
+}
+
+/**
+ * Real-time provisional speech transcription hypothesis event,
+ * emitted while the speaker is talking. Represents an updated/revised hypothesis
+ * rather than an append-only delta.
+ */
+export interface GeminiLiveInterimTranscriptEvent {
+  speaker: GeminiLiveSpeaker
+  text: string
 }
 
 /**
@@ -811,9 +823,16 @@ export interface MockPilotApi {
    * this is directly comparable with no clock-sync concerns.
    */
   sendMicChunk: (chunk: ArrayBuffer, capturedAtMs: number) => Promise<OperationResult>
+  /**
+   * High-performance one-way IPC audio streaming: delivers the PCM16 chunk directly
+   * without creating or waiting for a round-trip Promise.
+   */
+  streamMicChunk: (chunk: ArrayBuffer, capturedAtMs: number) => void
 
   /** Subscribes to live transcript fragments. Returns an unsubscribe function. */
   onLiveTranscript: (callback: (event: GeminiLiveTranscriptEvent) => void) => () => void
+  /** Subscribes to real-time provisional/interim transcript hypotheses. Returns an unsubscribe function. */
+  onLiveInterimTranscript: (callback: (event: GeminiLiveInterimTranscriptEvent) => void) => () => void
   /** Subscribes to interviewer audio-out chunks. Returns an unsubscribe function. */
   onLiveAudioChunk: (callback: (event: GeminiLiveAudioChunkEvent) => void) => () => void
   /** Subscribes to live-session connection-state changes. Returns an unsubscribe function. */

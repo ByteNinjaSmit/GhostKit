@@ -60,6 +60,7 @@ import type {
   GeminiLiveAnswerReviewEvent,
   GeminiLiveAudioChunkEvent,
   GeminiLiveConnectionStateEvent,
+  GeminiLiveInterimTranscriptEvent,
   GeminiLiveTurnFinishedEvent,
   GeminiLiveSpeaker,
   GeminiLiveTranscriptEvent,
@@ -133,6 +134,8 @@ const CONNECT_TIMEOUT_MS = 15000
 
 export interface GeminiLiveEventSink {
   onTranscript: (event: GeminiLiveTranscriptEvent) => void
+  /** Real-time provisional speech transcription hypothesis, updated live as speaker speaks. */
+  onInterimTranscript?: (event: GeminiLiveInterimTranscriptEvent) => void
   onAudioChunk: (event: GeminiLiveAudioChunkEvent) => void
   onConnectionState: (event: GeminiLiveConnectionStateEvent) => void
   /** The candidate started talking over the interviewer; Gemini stopped generating -- the player should drop any queued/abandoned audio for the interrupted turn. */
@@ -428,6 +431,7 @@ export function stopSession(): OperationResult {
   clearReconnectTimer()
   if (sink !== null) {
     try {
+      sink.onInterimTranscript?.({ speaker: 'interviewer', text: '' })
       sink.onConnectionState({ state: 'closed' })
     } catch {
       // Best effort
@@ -834,6 +838,12 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
   }
 
   const content = message.serverContent
+  if (content?.interimInputTranscription?.text) {
+    const interimText = content.interimInputTranscription.text
+    if (interimText.trim().length > 0) {
+      sink.onInterimTranscript?.({ speaker: 'interviewer', text: interimText })
+    }
+  }
   if (content?.inputTranscription) {
     // Every fragment, not just the first of a turn -- at the user's request,
     // to tell apart "Gemini stopped transcribing while the interviewer kept
@@ -873,6 +883,7 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
     // plays faster than realtime audio generates) -- tell it to drop the
     // abandoned turn rather than let stale audio keep playing.
     sink.onInterrupted()
+    sink.onInterimTranscript?.({ speaker: 'interviewer', text: '' })
   }
   if (content?.turnComplete === true) {
     console.log('[gemini-live][timing] turnComplete: the hidden model response finished generating at', new Date().toISOString())
@@ -991,6 +1002,7 @@ function clearInterviewerFlushTimer(): void {
 function flushInterviewerTurn(myGeneration: number): void {
   if (myGeneration !== generation) return
   clearInterviewerFlushTimer()
+  sink?.onInterimTranscript?.({ speaker: 'interviewer', text: '' })
   const question = interviewerTurnBuffer.trim()
   const startedAt = interviewerTurnStartedAt ?? Date.now()
   interviewerTurnBuffer = ''

@@ -12,24 +12,32 @@ export interface TranscriptTurn {
   turnId?: number
 }
 
+export interface ProvisionalCaption {
+  speaker: GeminiLiveSpeaker
+  text: string
+}
+
 interface TranscriptProps {
   turns: TranscriptTurn[]
+  provisionalCaption?: ProvisionalCaption | null
 }
 
 /**
  * Renders the live You/Interviewer turn list. Assembly of raw transcript
  * deltas (`GeminiLiveTranscriptEvent`) into these turns happens in the
  * caller (src/pages/Interview.tsx) -- this component only renders whatever
- * turns it's given, and auto-scrolls to the newest one.
+ * turns it's given, plus any active real-time provisional caption, and auto-scrolls to the newest one.
  */
-function Transcript({ turns }: TranscriptProps): JSX.Element {
+function Transcript({ turns, provisionalCaption }: TranscriptProps): JSX.Element {
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' })
-  }, [turns])
+  }, [turns, provisionalCaption])
 
-  if (turns.length === 0) {
+  const hasProvisional = Boolean(provisionalCaption && provisionalCaption.text.trim().length > 0)
+
+  if (turns.length === 0 && !hasProvisional) {
     return <p className="text-sm text-muted-foreground">Transcript will appear here once the interview starts.</p>
   }
 
@@ -59,6 +67,28 @@ function Transcript({ turns }: TranscriptProps): JSX.Element {
           </p>
         </div>
       ))}
+
+      {hasProvisional && provisionalCaption && (
+        <div className="flex flex-col gap-1 rounded-lg border border-cyan-500/40 bg-cyan-950/20 p-2.5 shadow-sm transition-all duration-150">
+          <div className="flex items-center gap-2">
+            <span className="relative flex h-2 w-2">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-cyan-400 opacity-75"></span>
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-cyan-500"></span>
+            </span>
+            <span className="text-xs font-semibold uppercase tracking-wider text-cyan-400">
+              {provisionalCaption.speaker === 'assistant'
+                ? '⚡ GhostKit AI (Generating…)'
+                : provisionalCaption.speaker === 'interviewer'
+                ? '🎧 Interviewer (Speaking live…)'
+                : 'You (Speaking live…)'}
+            </span>
+          </div>
+          <p className="text-sm italic leading-snug text-foreground/90">
+            {provisionalCaption.text}
+          </p>
+        </div>
+      )}
+
       <div ref={bottomRef} />
     </div>
   )
