@@ -464,6 +464,8 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
             </StatusBanner>
           )}
 
+          {isRunning && liveState === 'open' && <AudioHealthBanner pipelineRef={pipelineRef} />}
+
           {isRunning && workletActive === true && <ChunkCounter pipelineRef={pipelineRef} />}
 
           <div className="flex flex-col gap-2 border-t border-border pt-4">
@@ -529,6 +531,34 @@ function ChunkCounter({ pipelineRef }: ChunkCounterProps): JSX.Element {
   }, [pipelineRef])
 
   return <p ref={textRef} className="text-xs text-muted-foreground" />
+}
+
+/**
+ * Phase 7 correctness: while the live session is OPEN, poll the system-audio
+ * frame health and warn if chunks have stopped arriving -- so the UI never
+ * shows a healthy "Connected/Listening" state when audio is not actually
+ * reaching the interviewer model. Stale = no chunk for >1s (the worklet
+ * produces one every ~100ms; 1s is 10x the cadence, well clear of jitter).
+ * Polled, not per-frame -- this is a status check, not an animation.
+ */
+function AudioHealthBanner({ pipelineRef }: ChunkCounterProps): JSX.Element | null {
+  const [stale, setStale] = useState(false)
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const health = pipelineRef.current?.getSystemAudioHealth()
+      if (!health) return
+      setStale(health.msSinceLastChunk !== null && health.msSinceLastChunk > 1000)
+    }, 500)
+    return () => window.clearInterval(id)
+  }, [pipelineRef])
+
+  if (!stale) return null
+  return (
+    <StatusBanner tone="error">
+      Audio unavailable — system-audio frames have stopped reaching the interviewer. Check that system-audio sharing is
+      still active; the transcript will not update until it resumes.
+    </StatusBanner>
+  )
 }
 
 interface StatusBannerProps {

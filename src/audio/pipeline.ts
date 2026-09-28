@@ -52,8 +52,28 @@ export interface AudioPipelineHandle {
   systemChunkCount: () => number
   /** Whether the PCM worklet chain loaded successfully (false if `addModule` failed). */
   isWorkletActive: () => boolean
+  /**
+   * Liveness of the system-audio (interviewer) chunk stream -- the stream
+   * actually forwarded to ASR. `msSinceLastChunk` is `null` until the first
+   * chunk. Drives the "Audio unavailable" UX state (a stale value while the
+   * live session is open means frames are NOT reaching ASR, so "Listening" would
+   * be a lie) AND is the local frame-gap profiling signal for the Rust decision
+   * gate (docs/audio-latency-audit.md): a bounded, steady `maxGapMs` near the
+   * 100ms cadence is evidence there is no local buffering/backpressure hot path
+   * for a Rust ring buffer to fix.
+   */
+  getSystemAudioHealth: () => AudioHealth
   /** Tears down every node and closes the AudioContext. Safe to call more than once. */
   dispose: () => void
+}
+
+export interface AudioHealth {
+  /** ms since the last system-audio chunk (monotonic `performance.now`), or `null` if none yet. */
+  msSinceLastChunk: number | null
+  /** Largest gap seen between consecutive system chunks this session (ms). ~100 when healthy. */
+  maxGapMs: number
+  /** Total system chunks produced. */
+  count: number
 }
 
 export interface AudioPipelineOptions {
@@ -120,6 +140,11 @@ export async function createAudioPipeline(
       micChunkCount: () => mic.chunkCount.count,
       systemChunkCount: () => system.chunkCount.count,
       isWorkletActive: () => workletActive,
+      getSystemAudioHealth: () => ({
+        msSinceLastChunk: system.health.lastChunkAt === null ? null : performance.now() - system.health.lastChunkAt,
+        maxGapMs: system.health.maxGapMs,
+        count: system.chunkCount.count
+      }),
       dispose: () => {
         if (disposed) return
         disposed = true
@@ -142,6 +167,8 @@ interface Tap {
   analyser: AnalyserNode
   levelBuffer: Uint8Array<ArrayBuffer>
   chunkCount: { count: number }
+  /** Frame-cadence health, updated per chunk on the monotonic clock. */
+  health: { lastChunkAt: number | null; maxGapMs: number }
   disconnect: () => void
 }
 
@@ -159,6 +186,7 @@ function createTap(
   const levelBuffer = new Uint8Array(analyser.fftSize)
 
   const chunkCount = { count: 0 }
+  const health: { lastChunkAt: number | null; maxGapMs: number } = { lastChunkAt: null, maxGapMs: 0 }
   let source: MediaStreamAudioSourceNode | null = null
   let workletNode: AudioWorkletNode | null = null
 
@@ -175,6 +203,12 @@ function createTap(
       workletNode.port.onmessage = (event: MessageEvent<unknown>): void => {
         if (event.data instanceof ArrayBuffer) {
           chunkCount.count += 1
+          const nowPerf = performance.now()
+          if (health.lastChunkAt !== null) {
+            const gap = nowPerf - health.lastChunkAt
+            if (gap > health.maxGapMs) health.maxGapMs = gap
+          }
+          health.lastChunkAt = nowPerf
           const rawBuffer = event.data
           onChunk?.(rawBuffer, Date.now())
           // Recycle buffer back to worklet for zero-allocation streaming
@@ -192,6 +226,7 @@ function createTap(
     analyser,
     levelBuffer,
     chunkCount,
+    health,
     disconnect: () => {
       source?.disconnect()
       analyser.disconnect()

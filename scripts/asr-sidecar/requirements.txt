@@ -1,0 +1,4 @@
+# Local ASR sidecar (optional, non-default). See README.md.
+# GPU needs NVIDIA CUDA 12 + cuDNN 9 on PATH; CPU works without them (slower).
+faster-whisper>=1.0.0
+numpy>=1.24

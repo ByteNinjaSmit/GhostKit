@@ -293,6 +293,59 @@ let interviewerLastActivityAt: number | null = null
 /** Monotonically increasing ID for fast text answers, used to cancel stale in-flight streams. */
 let activeAnswerId = 0
 
+/**
+ * Monotonic clock reading in fractional milliseconds. `Date.now()` (used by
+ * every OTHER timing log in this file) can jump backwards/forwards if the OS
+ * clock is adjusted mid-session (NTP step, manual change) -- fine for the
+ * ISO-timestamped "when did this happen" logs, wrong for measuring an
+ * elapsed-time GAP. The multi-turn latency trace below (the ONLY thing this
+ * is used for) needs a monotonic source so a clock step can't manufacture a
+ * fake 4-8s gap or hide a real one. Process-wide origin; only ever differenced
+ * against itself, never mixed with a `Date.now()` value.
+ */
+function nowMono(): number {
+  return Number(process.hrtime.bigint() / 1000n) / 1000
+}
+
+/**
+ * MULTI-TURN LATENCY TRACE (2026-09-28). Isolates the reported 4-8s delay on
+ * the SECOND-and-later question into the one stage that actually causes it,
+ * without needing to reproduce it under a debugger. Monotonic (nowMono), so
+ * these are true elapsed gaps.
+ *
+ * `lastAnswerCompletedAtMono`  -- set when a fast-text answer fully finishes
+ *   (or a cache hit resolves): the "previous answer is done" mark the next
+ *   question's latency is measured FROM.
+ * `firstAudioAfterAnswerAtMono` -- first audio chunk received AFTER that mark:
+ *   proves audio is still flowing into this process (t_audio). If this stays
+ *   null for seconds, capture/worklet/IPC stalled (renderer side).
+ * `awaitingNextQuestionTrace`   -- true between an answer finishing and the
+ *   next interviewer utterance's first caption; gates the one-shot GAP log so
+ *   it fires once per transition, not per fragment.
+ *
+ * The decisive split (see the plan): with audio flowing (t_audio early) but
+ * the first interim caption arriving 4-8s later, the bottleneck is the ASR /
+ * Live-session turn boundary (the native-audio model's hidden output turn
+ * starving next-question transcription), NOT this app's capture or the answer
+ * queue. If instead t_audio itself is late, the audio pipeline stalled.
+ */
+let lastAnswerCompletedAtMono: number | null = null
+let firstAudioAfterAnswerAtMono: number | null = null
+let awaitingNextQuestionTrace = false
+
+/**
+ * Marks "the previous answer just finished streaming" and arms the multi-turn
+ * trace for the NEXT interviewer question. Called at every terminal point of a
+ * fast-text answer (cache hit, normal completion, no-output fallback, error
+ * fallback) -- from whichever of those the answer actually ended at, the clock
+ * for the next question's latency should start there.
+ */
+function markAnswerCompletedForTrace(): void {
+  lastAnswerCompletedAtMono = nowMono()
+  firstAudioAfterAnswerAtMono = null
+  awaitingNextQuestionTrace = true
+}
+
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 /** True between `startSession()`'s entry and its first await settling -- see module doc comment. */
 let connecting = false
@@ -362,6 +415,9 @@ export async function startSession(
     clearInterviewerFlushTimer()
     lastAudioChunkAt = null
     audioChunkCount = 0
+    lastAnswerCompletedAtMono = null
+    firstAudioAfterAnswerAtMono = null
+    awaitingNextQuestionTrace = false
     userTurnBuffer = { text: '', fragments: [] }
     lastActiveSpeaker = null
     questionForPendingAnswer = null
@@ -466,6 +522,9 @@ export function stopSession(): OperationResult {
   interviewerLastActivityAt = null
   activeAnswerId++
   clearInterviewerFlushTimer()
+  lastAnswerCompletedAtMono = null
+  firstAudioAfterAnswerAtMono = null
+  awaitingNextQuestionTrace = false
   userTurnBuffer = { text: '', fragments: [] }
   lastActiveSpeaker = null
   questionForPendingAnswer = null
@@ -554,6 +613,16 @@ export function sendAudioChunk(chunk: ArrayBuffer, capturedAtMs: number): Operat
     )
   }
   lastAudioChunkAt = now
+
+  // MULTI-TURN TRACE (t_audio): first chunk to arrive after the previous
+  // answer finished. Proves audio is still flowing into this process during
+  // the window where the next question is (allegedly) slow to be recognized.
+  if (awaitingNextQuestionTrace && firstAudioAfterAnswerAtMono === null && lastAnswerCompletedAtMono !== null) {
+    firstAudioAfterAnswerAtMono = nowMono()
+    console.log(
+      `[gemini-live][trace] t_audio: first audio chunk ${(firstAudioAfterAnswerAtMono - lastAnswerCompletedAtMono).toFixed(0)}ms after previous answer completed (audio pipeline is alive)`
+    )
+  }
 
   try {
     const base64 = Buffer.from(chunk).toString('base64')
@@ -864,6 +933,26 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
         interviewerTurnStartedAt = now
         interviewerSpeechStartedAt = now
         interviewerFirstCaptionAt = now
+        // MULTI-TURN TRACE (the money metric): first caption of a NEW
+        // interviewer utterance following a completed answer. This is the
+        // reported 4-8s window. Split into t_audio (above) vs this, both
+        // measured from the same previous-answer-done mark on the monotonic
+        // clock: audio early + this late => ASR/turn-boundary stall (Live
+        // model), not this app's pipeline; both late => audio pipeline stall.
+        if (awaitingNextQuestionTrace && lastAnswerCompletedAtMono !== null) {
+          const capMono = nowMono()
+          const prevAnswerToCaption = capMono - lastAnswerCompletedAtMono
+          const audioToCaption =
+            firstAudioAfterAnswerAtMono !== null ? capMono - firstAudioAfterAnswerAtMono : null
+          console.log(
+            `[gemini-live][trace] [GAP] prev-answer-done -> next-question first caption: ${prevAnswerToCaption.toFixed(0)}ms` +
+              (audioToCaption !== null
+                ? ` (t_audio->caption ${audioToCaption.toFixed(0)}ms = ASR/turn-boundary delay with audio confirmed flowing)`
+                : ' (NO audio chunk arrived after the answer -- audio pipeline stalled upstream)') +
+              ` preview: "${interimText.slice(0, 40)}"`
+          )
+          awaitingNextQuestionTrace = false
+        }
         console.log(`[gemini-live][timing] [T1] speech start to first caption: 0ms (preview: "${interimText.slice(0, 40)}") at`, new Date(now).toISOString())
       } else if (interviewerFirstCaptionAt === null) {
         interviewerFirstCaptionAt = now
@@ -1179,6 +1268,7 @@ async function runFastTextAnswerNow(
     console.log(`[gemini-live][timing] [T3] end of question to first answer text: ${cacheLatency}ms (learned cache hit: "${cached.question.slice(0, 60)}")`)
     console.log(`[gemini-live][benchmark] Turn #${answerIndex}: [T2 Endpoint Delay: ${endpointDelay}ms] [T3 First Token: ${cacheLatency}ms] [T4 Total: ${cacheLatency}ms (cache hit)]`)
     emitTranscript(myGeneration, 'assistant', { text: cached.answer, finished: true })
+    markAnswerCompletedForTrace()
     return
   }
 
@@ -1244,6 +1334,7 @@ async function runFastTextAnswerNow(
       console.log(
         `[gemini-live][benchmark] Turn #${answerIndex}: [T2 Endpoint Delay: ${endpointDelay}ms] [T3 First Token: ${ttft}ms] [T4 Total: ${totalAnswerMs}ms] (model: ${ANSWER_MODEL_ID})`
       )
+      markAnswerCompletedForTrace()
     }
   } catch (err) {
     const tErr = Date.now()
@@ -1253,6 +1344,7 @@ async function runFastTextAnswerNow(
         text: sawAny ? '' : "(Couldn't generate an answer for that -- try repeating the question.)",
         finished: true
       })
+      markAnswerCompletedForTrace()
     }
   }
 }
