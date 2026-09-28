@@ -283,6 +283,16 @@ const MIN_ANSWER_WORDS_FOR_REVIEW = 4
 let answerIndex = 0
 /** Bumped by startSession/stopSession; see module doc comment. */
 let generation = 0
+
+/** ms epoch when the interviewer's current utterance started. */
+let interviewerSpeechStartedAt: number | null = null
+/** ms epoch when the first caption (interim or final) for the current utterance was emitted. */
+let interviewerFirstCaptionAt: number | null = null
+/** ms epoch of the most recent speech activity (interim or final fragment) for the current utterance. */
+let interviewerLastActivityAt: number | null = null
+/** Monotonically increasing ID for fast text answers, used to cancel stale in-flight streams. */
+let activeAnswerId = 0
+
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 /** True between `startSession()`'s entry and its first await settling -- see module doc comment. */
 let connecting = false
@@ -345,6 +355,10 @@ export async function startSession(
     lastInterviewerQuestion = null
     interviewerTurnBuffer = ''
     interviewerTurnStartedAt = null
+    interviewerSpeechStartedAt = null
+    interviewerFirstCaptionAt = null
+    interviewerLastActivityAt = null
+    activeAnswerId++
     clearInterviewerFlushTimer()
     lastAudioChunkAt = null
     audioChunkCount = 0
@@ -447,6 +461,10 @@ export function stopSession(): OperationResult {
   lastInterviewerQuestion = null
   interviewerTurnBuffer = ''
   interviewerTurnStartedAt = null
+  interviewerSpeechStartedAt = null
+  interviewerFirstCaptionAt = null
+  interviewerLastActivityAt = null
+  activeAnswerId++
   clearInterviewerFlushTimer()
   userTurnBuffer = { text: '', fragments: [] }
   lastActiveSpeaker = null
@@ -841,10 +859,29 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
   if (content?.interimInputTranscription?.text) {
     const interimText = content.interimInputTranscription.text
     if (interimText.trim().length > 0) {
+      const now = Date.now()
+      if (interviewerTurnStartedAt === null) {
+        interviewerTurnStartedAt = now
+        interviewerSpeechStartedAt = now
+        interviewerFirstCaptionAt = now
+        console.log(`[gemini-live][timing] [T1] speech start to first caption: 0ms (preview: "${interimText.slice(0, 40)}") at`, new Date(now).toISOString())
+      } else if (interviewerFirstCaptionAt === null) {
+        interviewerFirstCaptionAt = now
+        const t1Delay = now - (interviewerSpeechStartedAt ?? now)
+        console.log(`[gemini-live][timing] [T1] speech start to first caption: ${t1Delay}ms (preview: "${interimText.slice(0, 40)}") at`, new Date(now).toISOString())
+      }
+      interviewerLastActivityAt = now
+      armInterviewerFlushTimer(myGeneration)
       sink.onInterimTranscript?.({ speaker: 'interviewer', text: interimText })
     }
   }
   if (content?.inputTranscription) {
+    const now = Date.now()
+    interviewerLastActivityAt = now
+    if (interviewerTurnStartedAt === null) {
+      interviewerTurnStartedAt = now
+      interviewerSpeechStartedAt = now
+    }
     // Every fragment, not just the first of a turn -- at the user's request,
     // to tell apart "Gemini stopped transcribing while the interviewer kept
     // talking" (a real bug) from "the interviewer was genuinely silent for a
@@ -866,18 +903,15 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
   // arrives via `message.data` below, harmlessly discarded downstream (the
   // renderer never plays it back).
   if (content?.interrupted === true) {
-    console.log('[gemini-live][timing] barge-in: interviewer spoke over the hidden model response at', new Date().toISOString())
-    // The candidate started talking over the interviewer; Gemini stopped
-    // generating, and the interviewer's in-progress turn never gets its own
-    // finished/turnComplete signal. Drop the partial buffer rather than let
-    // it glue onto the front of the interviewer's NEXT turn -- otherwise
-    // lastInterviewerQuestion (and any review scored against it) would be a
-    // mash of two unrelated questions.
-    // The cut-off text WAS spoken, so it belongs in the saved transcript --
-    // but not as `lastInterviewerQuestion` (it is an unfinished question).
+    console.log('[gemini-live][timing] barge-in: interviewer spoke over previous model response at', new Date().toISOString())
+    // Invalidate any in-progress fast text answer stream immediately so stale tokens don't leak out:
+    activeAnswerId++
     persistPartialInterviewerTurn()
     interviewerTurnBuffer = ''
     interviewerTurnStartedAt = null
+    interviewerSpeechStartedAt = null
+    interviewerFirstCaptionAt = null
+    interviewerLastActivityAt = null
     clearInterviewerFlushTimer()
     // The player is likely still scheduled seconds ahead of real time (it
     // plays faster than realtime audio generates) -- tell it to drop the
@@ -1004,21 +1038,30 @@ function flushInterviewerTurn(myGeneration: number): void {
   clearInterviewerFlushTimer()
   sink?.onInterimTranscript?.({ speaker: 'interviewer', text: '' })
   const question = interviewerTurnBuffer.trim()
-  const startedAt = interviewerTurnStartedAt ?? Date.now()
+  const finalizedAt = Date.now()
+  const startedAt = interviewerTurnStartedAt ?? finalizedAt
+  const lastActivity = interviewerLastActivityAt ?? startedAt
+  const endpointDelay = finalizedAt - lastActivity
+
   interviewerTurnBuffer = ''
   interviewerTurnStartedAt = null
+  interviewerSpeechStartedAt = null
+  interviewerFirstCaptionAt = null
+  interviewerLastActivityAt = null
+
   if (question.length > 0) {
     lastInterviewerQuestion = question
     console.log(
-      `[gemini-live][timing] question finalized (${question.length} chars, took ${Date.now() - startedAt}ms from first fragment to finalize) at`,
-      new Date().toISOString()
+      `[gemini-live][timing] [T2] end of question to finalized transcript: ${endpointDelay}ms (question: ${question.length} chars, utterance total: ${finalizedAt - startedAt}ms) at`,
+      new Date(finalizedAt).toISOString()
     )
     const turnId = recordTurn(historySessionId, 'interviewer', question, startedAt)
     if (turnId !== null && sink !== null) {
       sink.onTurnFinished({ speaker: 'interviewer', turnId })
       runInterviewerTranslation(myGeneration, turnId, question, usageToken)
     }
-    runFastTextAnswer(myGeneration, question, usageToken)
+    const answerId = ++activeAnswerId
+    runFastTextAnswer(myGeneration, answerId, question, finalizedAt, endpointDelay, usageToken)
   }
 }
 
@@ -1092,19 +1135,34 @@ let answerQueue: Promise<void> = Promise.resolve()
  * nothing downstream (GhostOverlay, Interview.tsx, history) needs to know
  * the answer no longer comes from the Live session itself. Never throws.
  */
-function runFastTextAnswer(myGeneration: number, question: string, usageTokenForTurn: number | null): void {
+function runFastTextAnswer(
+  myGeneration: number,
+  answerId: number,
+  question: string,
+  finalizedAt: number,
+  endpointDelay: number,
+  usageTokenForTurn: number | null
+): void {
   const systemInstruction = currentSystemInstruction
   if (systemInstruction === null) return
 
   answerQueue = answerQueue
-    .then(() => runFastTextAnswerNow(myGeneration, question, systemInstruction, usageTokenForTurn))
+    .then(() => runFastTextAnswerNow(myGeneration, answerId, question, finalizedAt, endpointDelay, systemInstruction, usageTokenForTurn))
     .catch(() => {})
 }
 
-async function runFastTextAnswerNow(myGeneration: number, question: string, systemInstruction: string, usageTokenForTurn: number | null): Promise<void> {
+async function runFastTextAnswerNow(
+  myGeneration: number,
+  answerId: number,
+  question: string,
+  finalizedAt: number,
+  endpointDelay: number,
+  systemInstruction: string,
+  usageTokenForTurn: number | null
+): Promise<void> {
   // A superseded generation (session stopped/restarted while this was
-  // queued behind an earlier answer) should never start a new stream.
-  if (myGeneration !== generation) return
+  // queued behind an earlier answer) or invalidated answer ID should never run.
+  if (myGeneration !== generation || answerId !== activeAnswerId) return
 
   // Cache check FIRST, inside the same queued slot as the generation it
   // would otherwise trigger -- both paths end up calling emitTranscript for
@@ -1115,9 +1173,11 @@ async function runFastTextAnswerNow(myGeneration: number, question: string, syst
   // cache" section for the threshold/safety reasoning.
   const cacheT0 = Date.now()
   const cached = await rag.findLearnedAnswer(question, usageTokenForTurn)
-  if (myGeneration !== generation) return
+  if (myGeneration !== generation || answerId !== activeAnswerId) return
   if (cached !== null) {
-    console.log(`[gemini-live][timing] answer served from learned cache in ${Date.now() - cacheT0}ms (matched: "${cached.question.slice(0, 60)}")`)
+    const cacheLatency = Date.now() - cacheT0
+    console.log(`[gemini-live][timing] [T3] end of question to first answer text: ${cacheLatency}ms (learned cache hit: "${cached.question.slice(0, 60)}")`)
+    console.log(`[gemini-live][benchmark] Turn #${answerIndex}: [T2 Endpoint Delay: ${endpointDelay}ms] [T3 First Token: ${cacheLatency}ms] [T4 Total: ${cacheLatency}ms (cache hit)]`)
     emitTranscript(myGeneration, 'assistant', { text: cached.answer, finished: true })
     return
   }
@@ -1126,88 +1186,75 @@ async function runFastTextAnswerNow(myGeneration: number, question: string, syst
   let chunkCount = 0
   let charCount = 0
   let fullAnswer = ''
-    // Timing diagnostics (2026-09-27, at the user's request, to tell apart
-    // "the model/network is slow" from "something in this app is stuck") --
-    // every stage of this call is timestamped: request start, key lookup
-    // done, connection to Google established (stream object returned), first
-    // token actually received, and final completion, each logged with the
-    // elapsed ms since the PREVIOUS stage so a real network stall shows up
-    // as a large gap in a specific spot rather than one opaque total.
-    const t0 = Date.now()
-    console.log('[gemini-live][timing] fast text answer: starting request')
-    try {
-      const apiKey = await getApiKey()
-      if (apiKey === null || apiKey.length === 0 || myGeneration !== generation) return
-      const t1 = Date.now()
-      console.log(`[gemini-live][timing] fast text answer: got key (+${t1 - t0}ms)`)
+  const t0 = Date.now()
+  console.log(`[gemini-live][timing] fast text answer #${answerId}: starting request (+${t0 - finalizedAt}ms after question finalized)`)
+  try {
+    const apiKey = await getApiKey()
+    if (apiKey === null || apiKey.length === 0 || myGeneration !== generation || answerId !== activeAnswerId) return
+    const t1 = Date.now()
+    console.log(`[gemini-live][timing] fast text answer #${answerId}: got key (+${t1 - t0}ms)`)
 
-      const ai = new GoogleGenAI({ apiKey, httpOptions: { timeout: ANSWER_TIMEOUT_MS } })
-      const stream = await ai.models.generateContentStream({
-        model: ANSWER_MODEL_ID,
-        contents: question,
-        config: { systemInstruction }
-      })
-      const t2 = Date.now()
-      console.log(`[gemini-live][timing] fast text answer: stream call returned, awaiting first chunk (+${t2 - t1}ms since key, +${t2 - t0}ms total)`)
+    const ai = new GoogleGenAI({ apiKey, httpOptions: { timeout: ANSWER_TIMEOUT_MS } })
+    const stream = await ai.models.generateContentStream({
+      model: ANSWER_MODEL_ID,
+      contents: question,
+      config: { systemInstruction }
+    })
+    const t2 = Date.now()
 
-      let firstChunkAt: number | null = null
-      for await (const chunk of stream) {
-        if (myGeneration !== generation) return
-        if (firstChunkAt === null) {
-          firstChunkAt = Date.now()
-          console.log(`[gemini-live][timing] fast text answer: FIRST CHUNK received (+${firstChunkAt - t2}ms since stream call, +${firstChunkAt - t0}ms total)`)
-        }
-        chunkCount++
-        if (chunk.usageMetadata !== undefined) {
-          usage.recordSession(usageTokenForTurn, 'live', ANSWER_MODEL_ID, chunk.usageMetadata)
-        }
-        // GenerateContentResponse.text already excludes `thought: true` parts
-        // (confirmed in the installed SDK) -- no separate thought-filtering
-        // needed here the way handleServerMessage needed for Live parts.
-        const text = chunk.text
-        if (typeof text === 'string' && text.length > 0) {
-          sawAny = true
-          charCount += text.length
-          fullAnswer += text
-          emitTranscript(myGeneration, 'assistant', { text, finished: false })
-        }
+    let firstChunkAt: number | null = null
+    for await (const chunk of stream) {
+      if (myGeneration !== generation || answerId !== activeAnswerId) {
+        console.log(`[gemini-live][timing] fast text answer #${answerId}: cancelled (stale -- newer question or user interrupted)`)
+        return
       }
-      if (myGeneration === generation) {
-        if (sawAny) {
-          emitTranscript(myGeneration, 'assistant', { text: '', finished: true })
-          // Fire-and-forget -- see rag.ts's cacheLearnedAnswer doc comment.
-          // Never awaited: caching must not add to this answer's own
-          // latency, and a failure here must never affect the live interview.
-          void rag.cacheLearnedAnswer(question, fullAnswer)
-        } else {
-          // A successful call that streamed zero usable text (safety filter,
-          // an empty/malformed response, ...) must still surface SOMETHING --
-          // previously this left the question sitting with no reply at all,
-          // indistinguishable from the app having silently hung. Never leave
-          // a question visibly unanswered with no explanation.
-          emitTranscript(myGeneration, 'assistant', { text: "(Couldn't generate an answer for that -- try repeating the question.)", finished: true })
-        }
+      if (firstChunkAt === null) {
+        firstChunkAt = Date.now()
+        const ttft = firstChunkAt - finalizedAt
+        console.log(
+          `[gemini-live][timing] [T3] end of question to first answer text (TTFT): ${ttft}ms (+${firstChunkAt - t2}ms model stream wait, +${firstChunkAt - t0}ms request total) at`,
+          new Date(firstChunkAt).toISOString()
+        )
       }
-      const tEnd = Date.now()
-      console.log(
-        `[gemini-live][timing] fast text answer: DONE -- ${chunkCount} chunks, ${charCount} chars, total ${tEnd - t0}ms` +
-          (firstChunkAt !== null ? ` (${firstChunkAt - t0}ms to first chunk, ${tEnd - firstChunkAt}ms streaming the rest)` : ' (no chunks received at all)')
-      )
-    } catch (err) {
-      const tErr = Date.now()
-      console.error(`[gemini-live][timing] fast text answer FAILED after ${tErr - t0}ms (${chunkCount} chunks received before the error):`, redact(String(err)))
-      if (myGeneration === generation) {
-        // Whatever streamed in before the failure is still worth keeping --
-        // flush it as a finished (if partial) answer rather than leaving the
-        // bubble stuck mid-generation forever. If nothing streamed at all,
-        // same "never leave it silently blank" reasoning as the zero-chunk
-        // success case above.
-        emitTranscript(myGeneration, 'assistant', {
-          text: sawAny ? '' : "(Couldn't generate an answer for that -- try repeating the question.)",
-          finished: true
-        })
+      chunkCount++
+      if (chunk.usageMetadata !== undefined) {
+        usage.recordSession(usageTokenForTurn, 'live', ANSWER_MODEL_ID, chunk.usageMetadata)
+      }
+      const text = chunk.text
+      if (typeof text === 'string' && text.length > 0) {
+        sawAny = true
+        charCount += text.length
+        fullAnswer += text
+        emitTranscript(myGeneration, 'assistant', { text, finished: false })
       }
     }
+    if (myGeneration === generation && answerId === activeAnswerId) {
+      if (sawAny) {
+        emitTranscript(myGeneration, 'assistant', { text: '', finished: true })
+        void rag.cacheLearnedAnswer(question, fullAnswer)
+      } else {
+        emitTranscript(myGeneration, 'assistant', { text: "(Couldn't generate an answer for that -- try repeating the question.)", finished: true })
+      }
+      const tEnd = Date.now()
+      const totalAnswerMs = tEnd - finalizedAt
+      const ttft = firstChunkAt !== null ? firstChunkAt - finalizedAt : 0
+      console.log(
+        `[gemini-live][timing] [T4] total answer latency: ${totalAnswerMs}ms (${chunkCount} chunks, ${charCount} chars)`
+      )
+      console.log(
+        `[gemini-live][benchmark] Turn #${answerIndex}: [T2 Endpoint Delay: ${endpointDelay}ms] [T3 First Token: ${ttft}ms] [T4 Total: ${totalAnswerMs}ms] (model: ${ANSWER_MODEL_ID})`
+      )
+    }
+  } catch (err) {
+    const tErr = Date.now()
+    console.error(`[gemini-live][timing] fast text answer #${answerId} FAILED after ${tErr - t0}ms (${chunkCount} chunks received before the error):`, redact(String(err)))
+    if (myGeneration === generation && answerId === activeAnswerId) {
+      emitTranscript(myGeneration, 'assistant', {
+        text: sawAny ? '' : "(Couldn't generate an answer for that -- try repeating the question.)",
+        finished: true
+      })
+    }
+  }
 }
 
 /**
