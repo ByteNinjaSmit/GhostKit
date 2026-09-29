@@ -346,6 +346,31 @@ function markAnswerCompletedForTrace(): void {
   awaitingNextQuestionTrace = true
 }
 
+/**
+ * Logs the multi-turn [GAP] (prev-answer-done -> first caption of the next
+ * question) and [T1]. Called from WHICHEVER transcript branch first sees a new
+ * utterance -- confirmed live 2026-09-29 that the native-audio model emits only
+ * committed `inputTranscription`, never `interimInputTranscription`, so the
+ * original interim-only placement never fired. `preview` is the fragment text.
+ */
+function noteFirstCaptionOfUtterance(now: number, preview: string): void {
+  if (awaitingNextQuestionTrace && lastAnswerCompletedAtMono !== null) {
+    const capMono = nowMono()
+    const prevAnswerToCaption = capMono - lastAnswerCompletedAtMono
+    const audioToCaption =
+      firstAudioAfterAnswerAtMono !== null ? capMono - firstAudioAfterAnswerAtMono : null
+    console.log(
+      `[gemini-live][trace] [GAP] prev-answer-done -> next-question first caption: ${prevAnswerToCaption.toFixed(0)}ms` +
+        (audioToCaption !== null
+          ? ` (t_audio->caption ${audioToCaption.toFixed(0)}ms = ASR/turn-boundary delay with audio confirmed flowing)`
+          : ' (NO audio chunk arrived after the answer -- audio pipeline stalled upstream)') +
+        ` preview: "${preview.slice(0, 40)}"`
+    )
+    awaitingNextQuestionTrace = false
+  }
+  console.log(`[gemini-live][timing] [T1] first caption of new utterance (preview: "${preview.slice(0, 40)}") at`, new Date(now).toISOString())
+}
+
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
 /** True between `startSession()`'s entry and its first await settling -- see module doc comment. */
 let connecting = false
@@ -418,6 +443,7 @@ export async function startSession(
     lastAnswerCompletedAtMono = null
     firstAudioAfterAnswerAtMono = null
     awaitingNextQuestionTrace = false
+    answerContext = []
     userTurnBuffer = { text: '', fragments: [] }
     lastActiveSpeaker = null
     questionForPendingAnswer = null
@@ -525,6 +551,7 @@ export function stopSession(): OperationResult {
   lastAnswerCompletedAtMono = null
   firstAudioAfterAnswerAtMono = null
   awaitingNextQuestionTrace = false
+  answerContext = []
   userTurnBuffer = { text: '', fragments: [] }
   lastActiveSpeaker = null
   questionForPendingAnswer = null
@@ -796,10 +823,21 @@ async function openConnection(apiKey: string, resumeHandle: string | null, myGen
       // to work from that garbled text and produced a nonsense reply.
       // `languageCodes` narrows the ASR's candidate languages rather than
       // picking one exclusively; en-IN specifically covers Indian-accented
-      // English (the actual failure case here), en-US as the general
-      // fallback, hi-IN kept since rule 1 (prompts/interviewer.md) commits to
-      // supporting genuine Hindi questions, not just English ones.
-      inputAudioTranscription: { languageCodes: ['en-IN', 'en-US', 'hi-IN'] },
+      // English (the actual failure case here), en-US as the general fallback.
+      //
+      // UPDATE 2026-09-29 (confirmed live): with hi-IN in the list, the model
+      // transcribed Indian-accented ENGLISH questions into Hindi/Devanagari
+      // ("valid value code in Python" -> "वैलिड वैल्यू कोड इन Python", "check
+      // palindrome or not" -> "चेक इन्ड्रोम और नॉट"), and the fast-answer call
+      // then worked from garbled script. Dropped hi-IN so the ASR commits to
+      // English -- this is the single biggest recognition-quality win for this
+      // user's (English) interviews. TRADE-OFF: genuine spoken-Hindi questions
+      // (prompts/interviewer.md rule 1) will now be transcribed phonetically as
+      // English rather than in Devanagari. If real Hindi support is needed
+      // back, prefer a dedicated STT with reliable per-utterance language
+      // detection (see docs/audio-latency-audit.md faster-whisper path) over
+      // re-adding hi-IN here, which regresses the far more common English case.
+      inputAudioTranscription: { languageCodes: ['en-IN', 'en-US'] },
       outputAudioTranscription: {},
       systemInstruction,
       // The candidate-facing overlay must show only the final answer -- never
@@ -933,27 +971,7 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
         interviewerTurnStartedAt = now
         interviewerSpeechStartedAt = now
         interviewerFirstCaptionAt = now
-        // MULTI-TURN TRACE (the money metric): first caption of a NEW
-        // interviewer utterance following a completed answer. This is the
-        // reported 4-8s window. Split into t_audio (above) vs this, both
-        // measured from the same previous-answer-done mark on the monotonic
-        // clock: audio early + this late => ASR/turn-boundary stall (Live
-        // model), not this app's pipeline; both late => audio pipeline stall.
-        if (awaitingNextQuestionTrace && lastAnswerCompletedAtMono !== null) {
-          const capMono = nowMono()
-          const prevAnswerToCaption = capMono - lastAnswerCompletedAtMono
-          const audioToCaption =
-            firstAudioAfterAnswerAtMono !== null ? capMono - firstAudioAfterAnswerAtMono : null
-          console.log(
-            `[gemini-live][trace] [GAP] prev-answer-done -> next-question first caption: ${prevAnswerToCaption.toFixed(0)}ms` +
-              (audioToCaption !== null
-                ? ` (t_audio->caption ${audioToCaption.toFixed(0)}ms = ASR/turn-boundary delay with audio confirmed flowing)`
-                : ' (NO audio chunk arrived after the answer -- audio pipeline stalled upstream)') +
-              ` preview: "${interimText.slice(0, 40)}"`
-          )
-          awaitingNextQuestionTrace = false
-        }
-        console.log(`[gemini-live][timing] [T1] speech start to first caption: 0ms (preview: "${interimText.slice(0, 40)}") at`, new Date(now).toISOString())
+        noteFirstCaptionOfUtterance(now, interimText)
       } else if (interviewerFirstCaptionAt === null) {
         interviewerFirstCaptionAt = now
         const t1Delay = now - (interviewerSpeechStartedAt ?? now)
@@ -970,6 +988,10 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
     if (interviewerTurnStartedAt === null) {
       interviewerTurnStartedAt = now
       interviewerSpeechStartedAt = now
+      interviewerFirstCaptionAt = now
+      // Native-audio emits only committed fragments (no interim), so this is
+      // where a new utterance is first seen -- fire the [GAP]/[T1] trace here.
+      noteFirstCaptionOfUtterance(now, content.inputTranscription.text ?? '')
     }
     // Every fragment, not just the first of a turn -- at the user's request,
     // to tell apart "Gemini stopped transcribing while the interviewer kept
@@ -1105,13 +1127,61 @@ function emitTranscript(myGeneration: number, speaker: GeminiLiveSpeaker, transc
   if (finished) flushUserTurn(myGeneration)
 }
 
-/** (Re)arms the client-side silence cutoff -- see `interviewerFlushTimer`'s doc comment. Called on every non-finished interviewer fragment. */
+/** Ends with sentence-final punctuation -> question clearly finished, finalize sooner (less latency). */
+const INTERVIEWER_FLUSH_COMPLETE_MS = 700
+/** No terminal punctuation -> the speaker may still be mid-question, wait longer (fewer mid-sentence splits). */
+const INTERVIEWER_FLUSH_INCOMPLETE_MS = 1300
+/**
+ * Buffer ends on a word that almost always CONTINUES ("...explain me the",
+ * "...generating AI also", "...what is the") -- a strong signal the speaker
+ * paused mid-question, not finished. Wait much longer before finalizing so the
+ * rest of the question merges into the same turn instead of splitting into a
+ * fragment that gets a useless "I didn't catch that" answer (the exact failure
+ * seen live 2026-09-29: one halting question split into 4 fragments).
+ */
+const INTERVIEWER_FLUSH_TRAILING_MS = 2400
+/**
+ * Words that, when they END the buffer, imply the question isn't over. Focused
+ * on articles/prepositions/conjunctions and lead-in verbs -- an interviewer's
+ * question almost never ENDS on one of these, but frequently pauses after one.
+ */
+const TRAILING_CONTINUATION_WORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'so', 'also', 'to', 'of', 'in', 'on', 'for', 'with',
+  'about', 'between', 'from', 'into', 'as', 'at', 'by', 'is', 'are', 'was', 'were', 'my', 'your',
+  'this', 'that', 'these', 'those', 'what', 'how', 'why', 'which', 'can', 'you', 'me', 'explain',
+  'tell', 'give', 'describe', 'define', 'write', 'using', 'like'
+])
+
+/** Picks the silence-window for the current interviewer buffer -- see the constants above. */
+function interviewerFlushDelayMs(buffer: string): number {
+  const buf = buffer.trim()
+  if (buf.length === 0) return INTERVIEWER_SILENCE_FLUSH_MS
+  if (/[.?!]$/.test(buf)) return INTERVIEWER_FLUSH_COMPLETE_MS
+  const lastWord = (buf.toLowerCase().match(/[\p{L}\p{N}']+/gu) ?? []).pop() ?? ''
+  if (TRAILING_CONTINUATION_WORDS.has(lastWord)) return INTERVIEWER_FLUSH_TRAILING_MS
+  return INTERVIEWER_FLUSH_INCOMPLETE_MS
+}
+
+/**
+ * (Re)arms the client-side silence cutoff -- see `interviewerFlushTimer`'s doc
+ * comment. Called on every non-finished interviewer fragment.
+ *
+ * PUNCTUATION-AWARE (2026-09-29): a single fixed window (1100ms) both split
+ * long questions with an internal pause AND added latency to short, clearly-
+ * finished ones. ASR punctuation is imperfect/late, but a trailing `.?!` is a
+ * decent "the question ended" signal and its absence a decent "might continue"
+ * one, so the window adapts: finalize sooner when the buffer looks complete,
+ * wait longer when it looks mid-sentence (the SQL question that split live on
+ * 2026-09-29 ended on "...from all order" -- no terminal punctuation). Re-armed
+ * every fragment, so a resumed sentence resets the window regardless.
+ */
 function armInterviewerFlushTimer(myGeneration: number): void {
   clearInterviewerFlushTimer()
+  const delay = interviewerFlushDelayMs(interviewerTurnBuffer)
   interviewerFlushTimer = setTimeout(() => {
     interviewerFlushTimer = null
     flushInterviewerTurn(myGeneration)
-  }, INTERVIEWER_SILENCE_FLUSH_MS)
+  }, delay)
 }
 
 function clearInterviewerFlushTimer(): void {
@@ -1149,9 +1219,50 @@ function flushInterviewerTurn(myGeneration: number): void {
       sink.onTurnFinished({ speaker: 'interviewer', turnId })
       runInterviewerTranslation(myGeneration, turnId, question, usageToken)
     }
-    const answerId = ++activeAnswerId
-    runFastTextAnswer(myGeneration, answerId, question, finalizedAt, endpointDelay, usageToken)
+    // Only GENERATE an answer if this turn is actually a question/request TO the
+    // candidate. An interview is mostly NOT questions -- greetings, "okay
+    // great", the interviewer describing the role, transitions -- and answering
+    // those produced junk ("okay great" -> a paragraph). The turn still shows in
+    // the transcript above regardless; this gate only decides whether to spend
+    // an answer on it. Leans inclusive (see shouldAnswerInterviewerTurn).
+    if (shouldAnswerInterviewerTurn(question)) {
+      const answerId = ++activeAnswerId
+      runFastTextAnswer(myGeneration, answerId, question, finalizedAt, endpointDelay, usageToken)
+    } else {
+      console.log(`[gemini-live][timing] interviewer turn not a question/request -- no answer generated: "${question.slice(0, 60)}"`)
+    }
   }
+}
+
+/**
+ * Decides whether a finalized interviewer turn is a question or request DIRECTED
+ * AT the candidate (answer it) vs interview conversation that isn't (skip).
+ *
+ * Ordering matters and is deliberately INCLUSIVE -- a missed real question
+ * leaves the candidate with no help exactly when they need it, far worse than
+ * an occasional answer to a borderline statement:
+ *  1. An explicit question mark or a question/imperative signal word anywhere
+ *     -> answer (covers "what is X", "can you", "explain", "write a", "give me
+ *     the SQL", "walk me through", "difference between", ...).
+ *  2. Otherwise, a turn that OPENS with a clear non-question marker (greeting,
+ *     acknowledgement, transition, or the interviewer talking about themselves/
+ *     the role/company) -> skip.
+ *  3. A single word with no question signal -> skip (kills stray ASR fragments
+ *     like "model" that used to each get a "didn't catch that" answer).
+ *  4. Anything else (uncertain) -> answer.
+ */
+const ANSWER_QUESTION_SIGNAL =
+  /(\?|\b(what|whats|what's|how|why|when|where|which|who|whose|whom|can you|could you|would you|will you|do you|did you|have you|are you|is there|are there|tell me|walk me|explain|describe|define|write|implement|design|code|reverse|sort|find|solve|calculate|derive|prove|list|name|compare|difference|elaborate|expand|give me|show me|what is|what are|how do|how would|how does|why is|why do)\b)/i
+const ANSWER_SKIP_OPENER =
+  /^(ok|okay|alright|right|great|good|nice|cool|perfect|awesome|excellent|sure|yeah|yep|yes|no|nope|thanks|thank you|got it|i see|i understand|understood|makes sense|make sense|correct|exactly|fair enough|no worries|no problem|hmm+|mm+|uh+|um+|so|well|let me|let's|lets|today|welcome|hello|hi|hey|good morning|good afternoon|good evening|my name|i am|i'm|we are|we're|we will|we'll|this is|that's fine|that is fine|the role|the position|the company|before we|first of all|to start|moving on|next|alright so)\b/i
+
+function shouldAnswerInterviewerTurn(text: string): boolean {
+  const t = text.trim()
+  if (t.length === 0) return false
+  if (ANSWER_QUESTION_SIGNAL.test(t)) return true
+  if (t.split(/\s+/).length < 2) return false
+  if (ANSWER_SKIP_OPENER.test(t)) return false
+  return true
 }
 
 /**
@@ -1213,6 +1324,36 @@ const ANSWER_TIMEOUT_MS = 20_000
 let answerQueue: Promise<void> = Promise.resolve()
 
 /**
+ * Rolling conversation context fed to the answer model so it understands the
+ * interview SO FAR, not just the isolated latest question. Without this, a
+ * follow-up like "and how would you optimize that?" or "what about the edge
+ * cases?" has no referent -- the model answered each question cold. Kept as
+ * alternating user (interviewer question) / model (our answer) turns, capped to
+ * the most recent MAX_ANSWER_CONTEXT_TURNS so the prompt can't grow unbounded
+ * across a long interview. Only real answered pairs are recorded (a skipped
+ * non-question or a superseded/failed turn never enters the history), so the
+ * context stays a clean Q/A transcript. Reset at session start/stop.
+ */
+const MAX_ANSWER_CONTEXT_TURNS = 8
+let answerContext: Array<{ role: 'user' | 'model'; text: string }> = []
+
+/** Records one answered Q/A pair into the rolling context, trimming to the cap. */
+function pushAnswerPair(question: string, answer: string): void {
+  answerContext.push({ role: 'user', text: question }, { role: 'model', text: answer })
+  if (answerContext.length > MAX_ANSWER_CONTEXT_TURNS) {
+    answerContext = answerContext.slice(answerContext.length - MAX_ANSWER_CONTEXT_TURNS)
+  }
+}
+
+/** Builds the `contents` array for the answer call: prior Q/A turns + the current question as the final user turn. */
+function buildAnswerContents(question: string): Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> {
+  return [
+    ...answerContext.map((turn) => ({ role: turn.role, parts: [{ text: turn.text }] })),
+    { role: 'user' as const, parts: [{ text: question }] }
+  ]
+}
+
+/**
  * Fires the moment an interviewer question is finalized (flushInterviewerTurn).
  * Queued (see `answerQueue`) rather than truly fire-and-forget, but still
  * doesn't block its caller -- flushInterviewerTurn/the live interview keeps
@@ -1260,17 +1401,16 @@ async function runFastTextAnswerNow(
   // it. A hit is answered from a local vector lookup (tens of ms) instead of
   // a live Gemini call (multiple seconds) -- see rag.ts's "Learned answer
   // cache" section for the threshold/safety reasoning.
+  // Fire the learned-answer cache lookup and the model request CONCURRENTLY.
+  // Previously the cache embed+search (a network embedding round-trip, measured
+  // live at ~0.5-1.4s) ran serially BEFORE the model call, adding that latency
+  // to EVERY answer -- wasted on a miss, which is the common case. Now the
+  // model request's own round-trip overlaps the cache lookup: on a miss we lose
+  // ~0ms waiting for the cache; on a hit we still short-circuit to the cached
+  // answer, abandoning the speculatively-started model stream (a rare wasted
+  // request, traded for ~0.6s shaved off every miss).
   const cacheT0 = Date.now()
-  const cached = await rag.findLearnedAnswer(question, usageTokenForTurn)
-  if (myGeneration !== generation || answerId !== activeAnswerId) return
-  if (cached !== null) {
-    const cacheLatency = Date.now() - cacheT0
-    console.log(`[gemini-live][timing] [T3] end of question to first answer text: ${cacheLatency}ms (learned cache hit: "${cached.question.slice(0, 60)}")`)
-    console.log(`[gemini-live][benchmark] Turn #${answerIndex}: [T2 Endpoint Delay: ${endpointDelay}ms] [T3 First Token: ${cacheLatency}ms] [T4 Total: ${cacheLatency}ms (cache hit)]`)
-    emitTranscript(myGeneration, 'assistant', { text: cached.answer, finished: true })
-    markAnswerCompletedForTrace()
-    return
-  }
+  const cachePromise = rag.findLearnedAnswer(question, usageTokenForTurn)
 
   let sawAny = false
   let chunkCount = 0
@@ -1285,17 +1425,50 @@ async function runFastTextAnswerNow(
     console.log(`[gemini-live][timing] fast text answer #${answerId}: got key (+${t1 - t0}ms)`)
 
     const ai = new GoogleGenAI({ apiKey, httpOptions: { timeout: ANSWER_TIMEOUT_MS } })
-    const stream = await ai.models.generateContentStream({
+    // Start the model stream request WITHOUT awaiting -- its network round-trip
+    // now overlaps the cache lookup below.
+    const streamPromise = ai.models.generateContentStream({
       model: ANSWER_MODEL_ID,
-      contents: question,
+      // Prior Q/A turns + this question, so the model answers in the context of
+      // the interview so far (follow-ups, "that", "the previous one", ...).
+      contents: buildAnswerContents(question),
       config: { systemInstruction }
     })
+
+    // Track the cache result WITHOUT blocking the model stream. The cache
+    // lookup is a network embed that can itself be slow/flaky (regressed live
+    // 2026-09-29 to a 13.8s TTFT when the embed hung while we awaited it here);
+    // a slow cache must never delay an already-ready model answer. So we only
+    // USE the cache if it has already produced a hit by the time the model's
+    // first token arrives -- otherwise the model answer wins and the cache
+    // result is ignored for this turn.
+    let cacheResult: Awaited<ReturnType<typeof rag.findLearnedAnswer>> | undefined
+    void cachePromise
+      .then((r) => {
+        cacheResult = r
+      })
+      .catch(() => {
+        cacheResult = null
+      })
+
+    const stream = await streamPromise
     const t2 = Date.now()
 
     let firstChunkAt: number | null = null
     for await (const chunk of stream) {
       if (myGeneration !== generation || answerId !== activeAnswerId) {
         console.log(`[gemini-live][timing] fast text answer #${answerId}: cancelled (stale -- newer question or user interrupted)`)
+        return
+      }
+      if (firstChunkAt === null && cacheResult) {
+        // Cache hit landed before the model's first token -- use it (cheaper
+        // and identical downstream), and abandon the model stream we started.
+        const cacheLatency = Date.now() - cacheT0
+        console.log(`[gemini-live][timing] [T3] end of question to first answer text: ${cacheLatency}ms (learned cache hit: "${cacheResult.question.slice(0, 60)}")`)
+        console.log(`[gemini-live][benchmark] Turn #${answerIndex}: [T2 Endpoint Delay: ${endpointDelay}ms] [T3 First Token: ${cacheLatency}ms] [T4 Total: ${cacheLatency}ms (cache hit)]`)
+        emitTranscript(myGeneration, 'assistant', { text: cacheResult.answer, finished: true })
+        pushAnswerPair(question, cacheResult.answer)
+        markAnswerCompletedForTrace()
         return
       }
       if (firstChunkAt === null) {
@@ -1322,6 +1495,7 @@ async function runFastTextAnswerNow(
       if (sawAny) {
         emitTranscript(myGeneration, 'assistant', { text: '', finished: true })
         void rag.cacheLearnedAnswer(question, fullAnswer)
+        pushAnswerPair(question, fullAnswer)
       } else {
         emitTranscript(myGeneration, 'assistant', { text: "(Couldn't generate an answer for that -- try repeating the question.)", finished: true })
       }
@@ -1358,6 +1532,14 @@ async function runFastTextAnswerNow(
  * bounded by TRANSLATE_TIMEOUT_MS, so this is safe to fire-and-forget.
  */
 function runInterviewerTranslation(myGeneration: number, turnId: number, question: string, usageTokenForTurn: number | null): void {
+  // With English-only ASR now (see languageCodes -- hi-IN dropped 2026-09-29),
+  // the transcript is already English for the overwhelmingly common case, so a
+  // translate call would be English->English: pure waste, and it was the source
+  // of the repeated `translation call failed: 504` noise seen live. Only spend
+  // the call when the text actually contains a non-Latin script (Devanagari,
+  // etc.) -- i.e. a genuinely non-English question. Basic/Latin-1/Latin-Extended
+  // (\u0000-ɏ) counts as "already English enough".
+  if (!/[^\u0000-ɏ]/.test(question)) return
   void translate
     .translateToEnglish(question, usageTokenForTurn)
     .then((result) => {

@@ -117,15 +117,32 @@ class PCMWorkletProcessor extends AudioWorkletProcessor {
       // Voice activity threshold: only boost active speech, don't amplify pure noise floor
       if (this.envelope > 0.005) {
         const desiredGain = Math.min(4.5, this.targetPeak / Math.max(0.04, this.envelope))
-        this.currentGain += 0.002 * (desiredGain - this.currentGain)
+        // Faster attack (0.01 ~= 100ms time constant at 16kHz output) so the
+        // START of a quiet question is boosted promptly rather than ~500ms in --
+        // ramping up (quiet speech appearing) is quicker than ramping down.
+        const coeff = desiredGain > this.currentGain ? 0.01 : 0.003
+        this.currentGain += coeff * (desiredGain - this.currentGain)
       } else {
         // Return gently to nominal gain when silent
         this.currentGain += 0.001 * (2.0 - this.currentGain)
       }
 
       const boosted = rawSample * this.currentGain
-      // Soft-knee limiter (hyperbolic tangent smoothly saturates between -1 and +1)
-      const limited = Math.tanh(boosted)
+      // TRANSPARENT soft limiter: leave normal speech LINEAR (tanh on every
+      // sample distorted all speech, e.g. 0.65 -> 0.57 plus harmonics, feeding
+      // the ASR persistently colored audio). Only soft-knee the part that
+      // exceeds the threshold, so peaks still can't clip but ordinary speech
+      // reaches the model undistorted -- clearer recognition.
+      const LIMIT_THRESHOLD = 0.8
+      const ab = boosted < 0 ? -boosted : boosted
+      let limited
+      if (ab <= LIMIT_THRESHOLD) {
+        limited = boosted
+      } else {
+        const range = 1 - LIMIT_THRESHOLD
+        const compressed = LIMIT_THRESHOLD + range * Math.tanh((ab - LIMIT_THRESHOLD) / range)
+        limited = boosted < 0 ? -compressed : compressed
+      }
 
       const intSample = Math.round(limited < 0 ? limited * 0x8000 : limited * 0x7fff)
       this.chunkBuffer[this.chunkOffset++] = intSample
