@@ -209,6 +209,12 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
         // Best-effort; Start will still surface "no API key" if it's actually missing.
       })
 
+    // Warm the local ASR sidecar (loads the model) as soon as the Interview page
+    // opens, so clicking Start has no wait. No-op for the cloud provider or when
+    // a session is already running. Fire-and-forget: failure just means the first
+    // Start pays the load, exactly as before.
+    void window.api.prewarmLiveAsr().catch(() => {})
+
     return () => {
       mountedRef.current = false
       startIdRef.current++
@@ -319,7 +325,15 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
         pipelineResult.player.dispose()
         stopCapture()
         streamsRef.current = null
-        setError(liveResult.error ?? 'Failed to start the interview session.')
+        const msg = liveResult.error ?? 'Failed to start the interview session.'
+        // Desync recovery: main still holds a session this renderer lost track of.
+        // Clear it so the very next Start succeeds instead of stranding the user.
+        if (/already running/i.test(msg)) {
+          void window.api.stopLiveSession()
+          setError('Cleared a session that was still running. Press Start again.')
+        } else {
+          setError(msg)
+        }
         setCaptureState('idle')
         setLiveState('idle')
         return
@@ -346,12 +360,17 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
   }
 
   const handleStop = (): void => {
-    if (captureState === 'idle') return
+    // Deliberately NOT guarded by `captureState === 'idle'`: if the main process
+    // still has a live session but this renderer thinks it's idle (a desync --
+    // e.g. a start that errored after main had already opened, or a reload),
+    // Stop must still be able to clear it so the user isn't stranded on "A live
+    // session is already running". teardown() calls window.api.stopLiveSession().
     startIdRef.current++ // invalidates an in-flight start, if Stop was hit during "starting"
     teardown()
     setCaptureState('idle')
     setLiveState('idle')
     setWorkletActive(null)
+    setError(null)
   }
 
   const isRunning = captureState === 'running'
@@ -420,7 +439,13 @@ function Interview({ setup, focusTopics, onClearFocus }: InterviewProps): JSX.El
             >
               {isStarting ? 'Starting…' : 'Start interview'}
             </Button>
-            <Button type="button" variant="outline" onClick={handleStop} disabled={captureState === 'idle' && liveState !== 'open'} title={`Stop (${SHORTCUT_TOGGLE_SESSION_LABEL})`}>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={handleStop}
+              disabled={captureState === 'idle' && liveState === 'idle' && error === null}
+              title={`Stop (${SHORTCUT_TOGGLE_SESSION_LABEL})`}
+            >
               Stop interview
             </Button>
             {(isRunning || liveState === 'open') && <LiveStateBadge state={liveState} />}

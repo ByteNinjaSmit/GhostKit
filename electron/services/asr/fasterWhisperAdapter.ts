@@ -35,8 +35,14 @@ import { redact } from '../../lib/redact'
 
 /** Max PCM frame accepted (matches the Live adapters' bound). */
 const MAX_AUDIO_CHUNK_BYTES = 32 * 1024
-/** How long to wait for the sidecar's `ready` event before giving up (model load can be slow first time). */
-const READY_TIMEOUT_MS = 30_000
+/**
+ * How long to wait for the sidecar's `ready` event before giving up. Generous
+ * because the FIRST run of a not-yet-cached model downloads it (medium ~1.5GB,
+ * large-v3 ~3GB) before loading -- 30s was too short and caused repeated respawn/
+ * re-download loops. Cached loads are only a few seconds; this ceiling only
+ * matters on the very first use of a new model size.
+ */
+const READY_TIMEOUT_MS = 180_000
 
 export interface FasterWhisperOptions {
   /** Python executable. Default: env GHOSTKIT_WHISPER_PYTHON or 'python'. */
@@ -135,6 +141,11 @@ export class FasterWhisperAsrAdapter implements ASRAdapter {
       this.emit(myGeneration, { type: 'session_ready', origin: 'provider', resumed: false })
     }
     return result
+  }
+
+  /** Swap the event sink on the running sidecar (keep-warm reuse across sessions) -- see ASRAdapter.attachSink. */
+  attachSink(sink: ASREventSink): void {
+    this.sink = sink
   }
 
   sendAudio(chunk: ArrayBuffer, _capturedAtMs: number): OperationResult {

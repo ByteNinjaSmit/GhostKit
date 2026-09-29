@@ -18,3 +18,8 @@ Thumbs.db
 # Env
 .env
 .env.local
+
+# faster-whisper sidecar local env/artifacts
+scripts/asr-sidecar/.venv/
+scripts/asr-sidecar/__pycache__/
+scripts/asr-sidecar/*.log

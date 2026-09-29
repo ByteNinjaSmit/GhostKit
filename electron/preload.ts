@@ -23,6 +23,8 @@ import type {
   AnswerSpeechMetrics,
   CodeReviewResult,
   CodingLanguage,
+  DiagnosticCheck,
+  DiagnosticsResult,
   GeminiLiveAnswerReviewEvent,
   GeminiLiveAudioChunkEvent,
   GeminiLiveConnectionStateEvent,
@@ -87,6 +89,26 @@ function toOperationResult(value: unknown): OperationResult {
 
 function toBoolean(value: unknown): boolean {
   return value === true
+}
+
+/** Validates the diagnostics payload from main, rebuilding each check field by field. */
+function toDiagnosticsResult(value: unknown): DiagnosticsResult {
+  if (typeof value === 'object' && value !== null && Array.isArray((value as { checks?: unknown }).checks)) {
+    const v = value as { ok?: unknown; checks: unknown[] }
+    const checks: DiagnosticCheck[] = []
+    for (const c of v.checks) {
+      if (typeof c === 'object' && c !== null) {
+        const cc = c as { name?: unknown; ok?: unknown; detail?: unknown }
+        checks.push({
+          name: typeof cc.name === 'string' ? cc.name : 'Check',
+          ok: cc.ok === true,
+          detail: typeof cc.detail === 'string' ? cc.detail : ''
+        })
+      }
+    }
+    return { ok: v.ok === true, checks }
+  }
+  return { ok: false, checks: [{ name: 'Diagnostics', ok: false, detail: 'Malformed response from main process.' }] }
 }
 
 function toStealthState(value: unknown): StealthState {
@@ -784,6 +806,12 @@ const api: MockPilotApi = {
 
   stopLiveSession: (): Promise<OperationResult> =>
     ipcRenderer.invoke(IPC_CHANNELS.GEMINI_LIVE_STOP).then(toOperationResult),
+
+  prewarmLiveAsr: (): Promise<OperationResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.GEMINI_LIVE_PREWARM).then(toOperationResult),
+
+  runDiagnostics: (): Promise<DiagnosticsResult> =>
+    ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_DIAGNOSTICS).then(toDiagnosticsResult),
 
   sendAudioChunk: (chunk: ArrayBuffer, capturedAtMs: number): Promise<OperationResult> =>
     ipcRenderer.invoke(IPC_CHANNELS.GEMINI_LIVE_SEND_AUDIO, { chunk, capturedAtMs }).then(toOperationResult),

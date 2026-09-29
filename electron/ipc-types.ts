@@ -25,6 +25,10 @@ export const IPC_CHANNELS = {
   GEMINI_LIVE_STOP: 'gemini-live:stop',
   GEMINI_LIVE_SEND_AUDIO: 'gemini-live:send-audio',
   GEMINI_LIVE_SEND_AUDIO_STREAM: 'gemini-live:send-audio-stream',
+  /** Warm up the local ASR sidecar (load the model) ahead of Start so the first interview has no wait. No-op for the cloud ASR provider. */
+  GEMINI_LIVE_PREWARM: 'gemini-live:prewarm',
+  /** Run a system self-check (API key, ASR provider, local GPU sidecar) and return per-item results for the Settings diagnostics panel. */
+  SYSTEM_DIAGNOSTICS: 'system:diagnostics',
 
   // Phase 2 -- main-initiated push events (mainWindow.webContents.send), the
   // first main->renderer channels in this app. See preload.ts for how these
@@ -144,6 +148,23 @@ export interface OperationResult {
 export interface TestKeyResult {
   ok: boolean
   error?: string
+}
+
+/** One line in the System Diagnostics panel. */
+export interface DiagnosticCheck {
+  /** Short label, e.g. "Gemini API key", "Local ASR sidecar (GPU)". */
+  name: string
+  /** Pass/fail. */
+  ok: boolean
+  /** Human-readable detail: what was found / how to fix. Never contains secrets. */
+  detail: string
+}
+
+/** Aggregate result of the Settings "Run diagnostics" button. */
+export interface DiagnosticsResult {
+  /** True only if every check passed. */
+  ok: boolean
+  checks: DiagnosticCheck[]
 }
 
 // ---------------------------------------------------------------------------
@@ -808,6 +829,10 @@ export interface MockPilotApi {
   startLiveSession: (setup: InterviewSetup, focusTopics?: readonly string[]) => Promise<OperationResult>
   /** Closes the current Gemini Live session, if any. Safe to call when nothing is running. */
   stopLiveSession: () => Promise<OperationResult>
+  /** Warms the local ASR sidecar (loads the model) so a later Start has no wait. No-op for the cloud provider or when a session is already active. */
+  prewarmLiveAsr: () => Promise<OperationResult>
+  /** Runs a system self-check (API key, ASR provider, local GPU sidecar) for the Settings diagnostics panel. */
+  runDiagnostics: () => Promise<DiagnosticsResult>
   /**
    * Sends one PCM16 chunk (16kHz mono, from src/audio/pipeline.ts's
    * system-audio worklet) to the active live session.

@@ -11,7 +11,7 @@ import {
   GHOST_CLICKTHROUGH_HOTKEY_LABEL,
   GHOST_PANIC_HOTKEY_LABEL
 } from '../../electron/ipc-types'
-import type { StealthState } from '../../electron/ipc-types'
+import type { StealthState, DiagnosticsResult } from '../../electron/ipc-types'
 
 type SaveStatus = 'idle' | 'saving' | 'saved' | 'error'
 type TestStatus = 'idle' | 'testing' | 'success' | 'error'
@@ -36,6 +36,22 @@ function Settings(): JSX.Element {
 
   const [testStatus, setTestStatus] = useState<TestStatus>('idle')
   const [testError, setTestError] = useState<string | null>(null)
+
+  const [diag, setDiag] = useState<DiagnosticsResult | null>(null)
+  const [diagRunning, setDiagRunning] = useState(false)
+
+  const handleRunDiagnostics = async (): Promise<void> => {
+    setDiagRunning(true)
+    setDiag(null)
+    try {
+      const result = await window.api.runDiagnostics()
+      setDiag(result)
+    } catch {
+      setDiag({ ok: false, checks: [{ name: 'Diagnostics', ok: false, detail: 'Failed to run diagnostics.' }] })
+    } finally {
+      setDiagRunning(false)
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -370,6 +386,49 @@ function Settings(): JSX.Element {
             <dt className="font-mono text-xs">{SCREENSHOT_HOTKEY_LABEL}</dt>
             <dd>Capture a screenshot of the display under the mouse -- global, only while the Coding round page is open; nothing is sent until you confirm</dd>
           </dl>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>System diagnostics</CardTitle>
+          <CardDescription>
+            One-click self-check: confirms your Gemini API key is saved, shows which speech-recognition provider is
+            active, and -- for the local faster-whisper provider -- loads the model on your GPU to verify it works (this
+            also warms it, so the next interview starts instantly).
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4">
+          <div>
+            <Button type="button" onClick={handleRunDiagnostics} disabled={diagRunning}>
+              {diagRunning ? 'Running checks…' : 'Run diagnostics'}
+            </Button>
+          </div>
+
+          {diag !== null && (
+            <div className="flex flex-col gap-2">
+              {diag.checks.map((check, i) => (
+                <div
+                  key={i}
+                  className={cn(
+                    'flex items-start gap-2 rounded-md border px-3 py-2 text-sm',
+                    check.ok ? 'border-success/30 bg-success/10' : 'border-destructive/30 bg-destructive/10'
+                  )}
+                >
+                  <span aria-hidden className={cn('mt-0.5 font-bold', check.ok ? 'text-success' : 'text-destructive')}>
+                    {check.ok ? '✓' : '✗'}
+                  </span>
+                  <span className="flex flex-col">
+                    <span className="font-medium">{check.name}</span>
+                    <span className="text-xs text-muted-foreground">{check.detail}</span>
+                  </span>
+                </div>
+              ))}
+              <p className={cn('text-sm font-medium', diag.ok ? 'text-success' : 'text-destructive')}>
+                {diag.ok ? 'All checks passed — you’re ready to interview.' : 'Some checks failed — see details above.'}
+              </p>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>

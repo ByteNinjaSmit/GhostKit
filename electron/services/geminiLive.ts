@@ -55,6 +55,9 @@ import * as usage from './usage'
 import { redact } from '../lib/redact'
 import { renderPromptTemplate } from '../lib/promptTemplate'
 import { computeSpeechMetrics, type SpeechFragment } from '../lib/speechMetrics'
+import { createASRAdapter, type ASRAdapterId } from './asr'
+import type { ASRAdapter, ASREventSink } from './asr/asrAdapter'
+import type { DiagnosticsResult, DiagnosticCheck } from '../ipc-types'
 import { GENERAL_TOPIC, INTERVIEW_ROLE_LABELS, parseFocusTopics } from '../ipc-types'
 import type {
   GeminiLiveAnswerReviewEvent,
@@ -149,6 +152,22 @@ export interface GeminiLiveEventSink {
 }
 
 let session: Session | null = null
+/**
+ * Active local-ASR adapter (faster-whisper sidecar) when the ASR provider is
+ * `faster-whisper-local`; `null` when running the default Gemini Live ASR.
+ * Exactly one of `session` / `asrAdapter` is non-null while a session runs.
+ */
+let asrAdapter: ASRAdapter | null = null
+/**
+ * A local-ASR adapter kept ALIVE (model loaded) between sessions so the next
+ * interview Start is instant instead of waiting for the sidecar to spawn and
+ * load. Started by `prewarmLocalAsr()` with an ignoring sink; adopted by
+ * `startSession` (real sink attached); returned here by `stopSession` (sink
+ * detached). `null` when nothing is warmed or the provider is the cloud one.
+ */
+let warmAdapter: ASRAdapter | null = null
+/** Sink that drops every event -- used while an adapter is warm but not bound to a session. */
+const IGNORING_ASR_SINK: ASREventSink = () => {}
 let sink: GeminiLiveEventSink | null = null
 /** Last session-resumption handle seen from the server; used to reconnect without losing session state. */
 let resumptionHandle: string | null = null
@@ -400,7 +419,7 @@ export async function startSession(
   setup: InterviewSetup,
   focusTopics: readonly string[] = []
 ): Promise<OperationResult> {
-  if (session !== null || connecting) {
+  if (session !== null || asrAdapter !== null || connecting) {
     return { ok: false, error: 'A live session is already running.' }
   }
   connecting = true
@@ -477,6 +496,36 @@ export async function startSession(
     currentSystemInstruction = systemInstruction
     currentResumeChunks = resumeChunksForReview
 
+    const provider = selectedAsrProvider()
+    if (provider === 'faster-whisper-local') {
+      // Local ASR: start the faster-whisper sidecar instead of a Gemini Live
+      // socket. The answer path (below, elsewhere) is unchanged and still needs
+      // the Gemini key -- only transcription moves off Gemini.
+      console.log('[gemini-live] ASR provider: faster-whisper-local (sidecar)')
+      const adopted = warmAdapter
+      if (adopted !== null && adopted.attachSink !== undefined) {
+        // Adopt the prewarmed sidecar -- model already loaded, so Start is instant.
+        console.log('[gemini-live] adopted prewarmed local ASR sidecar (no load wait)')
+        adopted.attachSink(makeAsrSink(myGeneration))
+        asrAdapter = adopted
+        warmAdapter = null
+      } else {
+        const adapter = createASRAdapter('faster-whisper-local')
+        const started = await adapter.start({ inputSampleRate: INPUT_SAMPLE_RATE, languageCodes: ['en-IN', 'en-US'] }, makeAsrSink(myGeneration))
+        if (myGeneration !== generation) {
+          adapter.stop()
+          return { ok: false, error: 'Cancelled.' }
+        }
+        if (!started.ok) {
+          return { ok: false, error: started.error ?? 'Local ASR failed to start. Check the sidecar setup (scripts/asr-sidecar).' }
+        }
+        asrAdapter = adapter
+      }
+      historySessionId = history.createSession(setup, focusTopics)
+      emitState(myGeneration, { state: 'open' })
+      return { ok: true }
+    }
+
     const newSession = await openConnection(apiKey, null, myGeneration, systemInstruction)
     if (myGeneration !== generation) {
       // stopSession() ran while the connection was still coming up --
@@ -510,12 +559,86 @@ export async function startSession(
       session = null
       sink = null
       if (stray !== null) safeClose(stray)
+      const strayAdapter = asrAdapter
+      asrAdapter = null
+      if (strayAdapter !== null) strayAdapter.stop()
       finishHistorySession()
     }
     return { ok: false, error: describeGeminiError(err) }
   } finally {
     connecting = false
   }
+}
+
+/**
+ * Warms the local ASR sidecar (spawns it + loads the model) with an ignoring
+ * sink, so a later `startSession` can adopt it with no load wait. No-op (returns
+ * ok) when the provider is the cloud one, or when a session or warm adapter is
+ * already present. Safe to call repeatedly (idempotent). Never throws.
+ */
+export async function prewarmLocalAsr(): Promise<OperationResult> {
+  if (selectedAsrProvider() !== 'faster-whisper-local') return { ok: true }
+  if (session !== null || asrAdapter !== null || warmAdapter !== null || connecting) return { ok: true }
+  try {
+    const adapter = createASRAdapter('faster-whisper-local')
+    const started = await adapter.start({ inputSampleRate: INPUT_SAMPLE_RATE, languageCodes: ['en-IN', 'en-US'] }, IGNORING_ASR_SINK)
+    if (!started.ok) {
+      adapter.stop()
+      return started
+    }
+    // A session may have started during the load; if so, discard the warm one.
+    if (session !== null || asrAdapter !== null || warmAdapter !== null) {
+      adapter.stop()
+      return { ok: true }
+    }
+    warmAdapter = adapter
+    console.log('[gemini-live] local ASR sidecar prewarmed and ready')
+    return { ok: true }
+  } catch (err) {
+    return { ok: false, error: describeGeminiError(err) }
+  }
+}
+
+/**
+ * System self-check for the Settings diagnostics panel: API key present, which
+ * ASR provider is active, and -- for local ASR -- that the GPU sidecar actually
+ * loads (this also warms it). Never throws; returns per-item pass/fail.
+ */
+export async function runDiagnostics(): Promise<DiagnosticsResult> {
+  const checks: DiagnosticCheck[] = []
+
+  let key: string | null = null
+  try {
+    key = await getApiKey()
+  } catch {
+    key = null
+  }
+  checks.push({
+    name: 'Gemini API key',
+    ok: key !== null && key.length > 0,
+    detail: key !== null && key.length > 0 ? 'Saved.' : 'Missing -- add one on the Settings page.'
+  })
+
+  const provider = selectedAsrProvider()
+  checks.push({
+    name: 'Speech recognition provider',
+    ok: true,
+    detail: provider === 'faster-whisper-local' ? 'Local faster-whisper (offline, GPU).' : 'Gemini Live (cloud, default).'
+  })
+
+  if (provider === 'faster-whisper-local') {
+    const t0 = Date.now()
+    const warm = await prewarmLocalAsr()
+    checks.push({
+      name: 'Local ASR sidecar (GPU)',
+      ok: warm.ok,
+      detail: warm.ok
+        ? `Model loaded and ready (${Date.now() - t0}ms).`
+        : `Failed: ${warm.error ?? 'unknown'} -- check scripts/asr-sidecar setup and the GPU.`
+    })
+  }
+
+  return { ok: checks.every((c) => c.ok), checks }
 }
 
 /** Closes the current session, if any, and cancels any in-flight connect/reconnect. Safe to call when nothing is running. */
@@ -535,6 +658,8 @@ export function stopSession(): OperationResult {
   }
   const current = session
   session = null
+  const currentAdapter = asrAdapter
+  asrAdapter = null
   sink = null
   resumptionHandle = null
   currentSystemInstruction = null
@@ -559,7 +684,27 @@ export function stopSession(): OperationResult {
   if (current !== null) {
     safeClose(current)
   }
+  if (currentAdapter !== null) {
+    // Keep the local-ASR sidecar ALIVE (model loaded) for the next Start instead
+    // of killing it: detach its sink so idle events are dropped, and stash it as
+    // the warm adapter. The next startSession adopts it with zero load wait.
+    // (A generation bump already happened above, so any late event from it
+    // no-ops even before the sink swap.)
+    if (currentAdapter.attachSink !== undefined && warmAdapter === null) {
+      currentAdapter.attachSink(IGNORING_ASR_SINK)
+      warmAdapter = currentAdapter
+    } else {
+      currentAdapter.stop()
+    }
+  }
   return { ok: true }
+}
+
+/** Fully stops any warm local-ASR sidecar. Call on app quit / provider change. */
+export function shutdownLocalAsr(): void {
+  const w = warmAdapter
+  warmAdapter = null
+  if (w !== null) w.stop()
 }
 
 /** ms epoch this module last received an audio chunk via `sendAudioChunk`; `null` between sessions. Used only for the stall/health logging below. */
@@ -609,7 +754,7 @@ const CAPTURE_TO_RECEIPT_WARN_MS = 60
  * regardless of what the caller already checked.
  */
 export function sendAudioChunk(chunk: ArrayBuffer, capturedAtMs: number): OperationResult {
-  if (session === null) {
+  if (session === null && asrAdapter === null) {
     return { ok: false, error: 'No live session is running.' }
   }
   if (chunk.byteLength === 0 || chunk.byteLength > MAX_AUDIO_CHUNK_BYTES) {
@@ -651,9 +796,14 @@ export function sendAudioChunk(chunk: ArrayBuffer, capturedAtMs: number): Operat
     )
   }
 
+  // Local ASR: forward the raw PCM chunk to the sidecar instead of Gemini.
+  if (asrAdapter !== null) {
+    return asrAdapter.sendAudio(chunk, capturedAtMs)
+  }
+
   try {
     const base64 = Buffer.from(chunk).toString('base64')
-    session.sendRealtimeInput({
+    session!.sendRealtimeInput({
       audio: { data: base64, mimeType: `audio/pcm;rate=${INPUT_SAMPLE_RATE}` }
     })
     return { ok: true }
@@ -947,6 +1097,100 @@ async function openConnection(apiKey: string, resumeHandle: string | null, myGen
   }
 }
 
+/**
+ * Handles one INTERIM (provisional, revisable) interviewer transcript
+ * hypothesis. Shared by the Gemini Live message handler and the faster-whisper
+ * adapter's `interim_transcript` events, so live captions + the [T1]/[GAP]
+ * trace + the silence-flush timer behave identically whichever ASR backend is
+ * active. Guards `sink` itself since the adapter path calls this directly.
+ */
+function handleInterviewerInterim(myGeneration: number, interimText: string): void {
+  if (myGeneration !== generation || sink === null) return
+  if (interimText.trim().length === 0) return
+  const now = Date.now()
+  if (interviewerTurnStartedAt === null) {
+    interviewerTurnStartedAt = now
+    interviewerSpeechStartedAt = now
+    interviewerFirstCaptionAt = now
+    noteFirstCaptionOfUtterance(now, interimText)
+  } else if (interviewerFirstCaptionAt === null) {
+    interviewerFirstCaptionAt = now
+    const t1Delay = now - (interviewerSpeechStartedAt ?? now)
+    console.log(`[gemini-live][timing] [T1] speech start to first caption: ${t1Delay}ms (preview: "${interimText.slice(0, 40)}") at`, new Date(now).toISOString())
+  }
+  interviewerLastActivityAt = now
+  armInterviewerFlushTimer(myGeneration)
+  sink.onInterimTranscript?.({ speaker: 'interviewer', text: interimText })
+}
+
+/**
+ * Handles one COMMITTED interviewer transcript fragment. Shared by the Gemini
+ * Live handler (`inputTranscription`) and the faster-whisper adapter's
+ * `final_transcript` events. Accumulates into the turn buffer via
+ * `emitTranscript` and (re)arms the silence flush; `providerFinal` is surfaced
+ * in the log but NOT used to finalize (unreliable -- see emitTranscript).
+ */
+function handleInterviewerCommitted(myGeneration: number, text: string, providerFinal: boolean): void {
+  if (myGeneration !== generation || sink === null) return
+  const now = Date.now()
+  interviewerLastActivityAt = now
+  if (interviewerTurnStartedAt === null) {
+    interviewerTurnStartedAt = now
+    interviewerSpeechStartedAt = now
+    interviewerFirstCaptionAt = now
+    // Native-audio (and the whisper sidecar) can emit the first sign of a new
+    // utterance as a committed fragment -- fire the [GAP]/[T1] trace here too.
+    noteFirstCaptionOfUtterance(now, text)
+  }
+  const preview = text.slice(0, 40)
+  console.log(
+    `[gemini-live][timing] interviewer fragment: "${preview}${text.length > 40 ? '…' : ''}" finished=${providerFinal} at`,
+    new Date().toISOString()
+  )
+  emitTranscript(myGeneration, 'interviewer', { text, finished: providerFinal })
+}
+
+/**
+ * Which ASR backend to use, from `GHOSTKIT_ASR` (default: the proven Gemini
+ * Live native-audio path). Set `GHOSTKIT_ASR=faster-whisper-local` to route
+ * interviewer audio through the local faster-whisper sidecar instead (see
+ * scripts/asr-sidecar/). Only the ASR/transcription backend changes -- the
+ * answer path (gemini-2.5-flash + conversation context + question gate),
+ * endpointing, history, translation and usage all stay identical.
+ */
+function selectedAsrProvider(): ASRAdapterId {
+  return process.env.GHOSTKIT_ASR === 'faster-whisper-local' ? 'faster-whisper-local' : 'gemini-native-audio'
+}
+
+/**
+ * Maps an ASR adapter's provider-neutral events onto the SAME interviewer
+ * transcript/connection-state handlers the Gemini Live path uses, so everything
+ * downstream is backend-agnostic.
+ */
+function makeAsrSink(myGeneration: number): ASREventSink {
+  return (ev) => {
+    if (myGeneration !== generation) return
+    switch (ev.type) {
+      case 'interim_transcript':
+        handleInterviewerInterim(myGeneration, ev.text)
+        break
+      case 'final_transcript':
+        handleInterviewerCommitted(myGeneration, ev.textDelta, ev.providerFinal)
+        break
+      case 'provider_error':
+        emitState(myGeneration, ev.willRetry ? { state: 'reconnecting' } : { state: 'error', message: ev.message })
+        break
+      case 'session_closed':
+        emitState(myGeneration, { state: 'closed' })
+        break
+      // speech_start / speech_end / session_ready / interrupted: the client-side
+      // silence-flush endpoint and startSession's own 'open' emit cover these.
+      default:
+        break
+    }
+  }
+}
+
 function handleServerMessage(myGeneration: number, message: LiveServerMessage): void {
   if (myGeneration !== generation || sink === null) return
 
@@ -964,46 +1208,10 @@ function handleServerMessage(myGeneration: number, message: LiveServerMessage): 
 
   const content = message.serverContent
   if (content?.interimInputTranscription?.text) {
-    const interimText = content.interimInputTranscription.text
-    if (interimText.trim().length > 0) {
-      const now = Date.now()
-      if (interviewerTurnStartedAt === null) {
-        interviewerTurnStartedAt = now
-        interviewerSpeechStartedAt = now
-        interviewerFirstCaptionAt = now
-        noteFirstCaptionOfUtterance(now, interimText)
-      } else if (interviewerFirstCaptionAt === null) {
-        interviewerFirstCaptionAt = now
-        const t1Delay = now - (interviewerSpeechStartedAt ?? now)
-        console.log(`[gemini-live][timing] [T1] speech start to first caption: ${t1Delay}ms (preview: "${interimText.slice(0, 40)}") at`, new Date(now).toISOString())
-      }
-      interviewerLastActivityAt = now
-      armInterviewerFlushTimer(myGeneration)
-      sink.onInterimTranscript?.({ speaker: 'interviewer', text: interimText })
-    }
+    handleInterviewerInterim(myGeneration, content.interimInputTranscription.text)
   }
   if (content?.inputTranscription) {
-    const now = Date.now()
-    interviewerLastActivityAt = now
-    if (interviewerTurnStartedAt === null) {
-      interviewerTurnStartedAt = now
-      interviewerSpeechStartedAt = now
-      interviewerFirstCaptionAt = now
-      // Native-audio emits only committed fragments (no interim), so this is
-      // where a new utterance is first seen -- fire the [GAP]/[T1] trace here.
-      noteFirstCaptionOfUtterance(now, content.inputTranscription.text ?? '')
-    }
-    // Every fragment, not just the first of a turn -- at the user's request,
-    // to tell apart "Gemini stopped transcribing while the interviewer kept
-    // talking" (a real bug) from "the interviewer was genuinely silent for a
-    // while" (normal -- reading the previous answer, thinking), which look
-    // identical from the outside without this.
-    const preview = (content.inputTranscription.text ?? '').slice(0, 40)
-    console.log(
-      `[gemini-live][timing] interviewer fragment: "${preview}${(content.inputTranscription.text ?? '').length > 40 ? '…' : ''}" finished=${content.inputTranscription.finished === true} at`,
-      new Date().toISOString()
-    )
-    emitTranscript(myGeneration, 'interviewer', content.inputTranscription)
+    handleInterviewerCommitted(myGeneration, content.inputTranscription.text ?? '', content.inputTranscription.finished === true)
   }
   // The Live model's OWN spoken response (content.outputTranscription /
   // content.modelTurn.parts) is deliberately never shown to the candidate --

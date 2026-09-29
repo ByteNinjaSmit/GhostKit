@@ -35,6 +35,7 @@ import type {
   HistoryWeakAreasResult,
   InterviewDifficulty,
   InterviewRole,
+  DiagnosticsResult,
   InterviewSetup,
   OperationResult,
   QaBankEntry,
@@ -898,6 +899,16 @@ function registerIpcHandlers(): void {
     const result = geminiLive.stopSession()
     sendToRenderer(IPC_CHANNELS.GEMINI_LIVE_CONNECTION_STATE, { state: 'closed' })
     return result
+  })
+
+  ipcMain.handle(IPC_CHANNELS.GEMINI_LIVE_PREWARM, async (event): Promise<OperationResult> => {
+    if (!isTrustedSender(event)) return { ok: false, error: 'Unauthorized.' }
+    return geminiLive.prewarmLocalAsr()
+  })
+
+  ipcMain.handle(IPC_CHANNELS.SYSTEM_DIAGNOSTICS, async (event): Promise<DiagnosticsResult> => {
+    if (!isTrustedSender(event)) return { ok: false, checks: [{ name: 'Authorization', ok: false, detail: 'Unauthorized.' }] }
+    return geminiLive.runDiagnostics()
   })
 
   ipcMain.handle(IPC_CHANNELS.GEMINI_LIVE_SEND_AUDIO, async (event, payload: unknown): Promise<OperationResult> => {

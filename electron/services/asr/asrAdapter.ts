@@ -170,6 +170,14 @@ export interface ASRAdapter {
   sendAudio(chunk: ArrayBuffer, capturedAtMs: number): OperationResult
   /** Closes the current session and cancels any in-flight connect/reconnect. Safe to call when nothing is running. */
   stop(): OperationResult
+  /**
+   * Swaps the event sink on an ALREADY-STARTED adapter without restarting it.
+   * Used to keep a heavy backend (the faster-whisper sidecar) warm across
+   * interview sessions: prewarm starts it with an ignoring sink, then each Start
+   * attaches the session's real sink and each Stop detaches back to ignoring.
+   * Optional -- backends with no warm-reuse benefit may omit it.
+   */
+  attachSink?(sink: ASREventSink): void
 }
 
 /** Factory signature -- lets the consumer pick an adapter by config/flag without importing every provider module eagerly. */
